@@ -9,9 +9,7 @@ struct SegmentStore {
     std::vector<Segment*> segments;
     std::atomic<uint64_t> global_seg_ver;
 
-    SegmentStore(size_t nseg, uint32_t obj_size, uint64_t cap)
-        : global_seg_ver(0) {
-        segments.reserve(nseg);
+    SegmentStore(size_t nseg, uint64_t cap) : global_seg_ver(0) {
         for (size_t i = 0; i < nseg; i++) {
             segments.push_back(static_cast<Segment*>(malloc(sizeof(Segment))));
         }
@@ -27,10 +25,23 @@ struct SegmentStore {
         return *segments[hash % segments.size()];
     }
 
-    bool try_acquire(Segment& seg, uint64_t tid, uint64_t term) {
-        uint64_t expected = UINT64_MAX;
-        if (!seg.meta.owner_id.compare_exchange_strong(expected, tid))
+    /**
+     * @param seg The segment to acquire.
+     * @param wid The worker ID attempting to acquire the segment.
+     * @param term The term ID for the acquisition.
+     * @return True if acquisition was successful, false otherwise.
+     */
+    bool try_acquire(Segment& seg, uint64_t wid, uint64_t term) {
+        uint8_t status = seg.meta.status.load(std::memory_order_acquire);
+        if (status != (uint8_t)SegmentStatus::FREE)
             return false;
+
+        uint64_t expected_owner = UINT64_MAX;
+        if (!seg.meta.owner_id.compare_exchange_strong(
+            expected_owner, wid, 
+            std::memory_order_acq_rel)) {
+            return false;
+        }
 
         seg.meta.seg_ver.store(global_seg_ver.fetch_add(1) + 1, std::memory_order_release);
         seg.meta.term_id.store(term, std::memory_order_release);
