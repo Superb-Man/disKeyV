@@ -7,17 +7,17 @@
 
 struct SegmentStore {
     std::vector<Segment*> segments;
-    std::atomic<uint64_t> global_seg_ver;
+    std::atomic<uint64_t> global_seg_ver{0};
 
-    SegmentStore(size_t nseg, uint64_t cap) : global_seg_ver(0) {
+    SegmentStore(size_t nseg, uint64_t cap) {
         for (size_t i = 0; i < nseg; i++) {
-            segments.push_back(static_cast<Segment*>(malloc(sizeof(Segment))));
+            segments.push_back(new Segment(i, cap));
         }
     }
 
     ~SegmentStore() {
         for (Segment* s : segments) {
-            free(s);
+            delete s;
         }
     }
 
@@ -43,7 +43,7 @@ struct SegmentStore {
             return false;
         }
 
-        seg.meta.seg_ver.store(global_seg_ver.fetch_add(1) + 1, std::memory_order_release);
+        seg.meta.seg_ver.store(++global_seg_ver, std::memory_order_release);
         seg.meta.term_id.store(term, std::memory_order_release);
         seg.meta.status.store((uint8_t)SegmentStatus::ACTIVE, std::memory_order_release);
         seg.meta.tail_idx.store(0, std::memory_order_release);
