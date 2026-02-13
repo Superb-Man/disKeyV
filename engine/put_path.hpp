@@ -18,21 +18,20 @@ struct PutPath {
         SegmentStore& store,
         IncarnationTable& inc,
         const std::string& key,
-        const std::vector<uint8_t>& value,
-        ApplyRecord& out_apply) {
+        const std::vector<uint8_t>& value, ApplyRecord& out_apply) {
 
-        uint64_t seq = w.sequence_number.fetch_add(1, std::memory_order_relaxed) + 1;
-        uint64_t incarnation = inc.next(key);
-        uint64_t term = rs.current_term.load(std::memory_order_acquire);
+            uint64_t seq = w.sequence_number.fetch_add(1, std::memory_order_relaxed) + 1;
+            uint64_t incarnation = inc.next(key);
+            uint64_t term = rs.current_term.load(std::memory_order_acquire);
 
-        size_t h = std::hash<std::string>{}(key);
-        size_t seg_idx = h % store.segments.size();
-        Segment& seg = *store.segments[seg_idx];
+            size_t h = std::hash<std::string>{}(key);
+            size_t seg_idx = h % store.segments.size();
+            Segment& seg = *store.segments[seg_idx];
 
-        if (seg.meta.status.load(std::memory_order_acquire)
-            != (uint8_t)SegmentStatus::ACTIVE) {
-            if (!store.try_acquire(seg, w.worker_id, term))
-                return false;
+            if (seg.meta.status.load(std::memory_order_acquire)
+                != (uint8_t)SegmentStatus::ACTIVE) {
+                if (!store.try_acquire(seg, w.worker_id, term))
+                    return false;
         }
 
         ObjectEntry obj(term, seq, incarnation, key, value);

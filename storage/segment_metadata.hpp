@@ -15,7 +15,8 @@ struct SegmentMetadata {
     std::atomic<uint64_t> seg_ver;
     uint32_t object_size;
     std::atomic<uint64_t> tail_idx;
-
+    std::atomic<bool> committed{false};
+    
     SegmentMetadata()
         : owner_id(UINT64_MAX),
           term_id(0),

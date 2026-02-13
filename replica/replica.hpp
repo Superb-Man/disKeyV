@@ -20,6 +20,17 @@ struct Request {
     std::string key;
     std::vector<uint8_t> value;
 };
+struct Follower {
+
+    uint64_t id;
+    SegmentStore store;
+
+    Follower(uint64_t rid,
+             size_t nseg,
+             uint64_t cap)
+        : id(rid),
+          store(nseg, cap) {}
+};
 
 
 struct Replica {
@@ -44,22 +55,35 @@ struct Replica {
     bool stop;
     bool shutdown_called;
 
-    Replica(uint64_t rid, int nworkers)
+    // Replication
+    size_t replica_count;
+    size_t quorum; // number of replicas required for majority
+    std::vector<Follower*> followers;
+
+    Replica(uint64_t rid, int nworkers, size_t total_replicas)
         : rs(rid),
-          store(32, 1024),
-          ht(4096),
-          inc(2048),
-          stop(false),
-          shutdown_called(false) {
+        store(32, 1024),
+        ht(4096),
+        inc(2048),
+        stop(false),
+        shutdown_called(false),
+        replica_count(total_replicas),
+        quorum((total_replicas / 2) + 1)
+    {
         pthread_mutex_init(&req_mtx, nullptr);
         pthread_cond_init(&req_cv, nullptr);
 
         pthread_mutex_init(&apply_mtx, nullptr);
         pthread_cond_init(&apply_cv, nullptr);
 
+        for (size_t i = 1; i < replica_count; ++i) {
+            followers.push_back(new Follower(i, 32, 1024));
+        }
+
         start_workers(nworkers);
         start_apply_thread();
     }
+
 
     ~Replica() {
         shutdown();
@@ -69,6 +93,12 @@ struct Replica {
 
         pthread_mutex_destroy(&apply_mtx);
         pthread_cond_destroy(&apply_cv);
+
+        for (Follower* f : followers) {
+            delete f;
+        }
+
+        followers.clear();
     }
 
     static void* worker_entry(void* arg) {
@@ -110,15 +140,21 @@ struct Replica {
 
             if (req.type == OpType::PUT) {
                 ApplyRecord ar;
-                if (PutPath::put(
-                        w, rs, store, inc,
-                        req.key, req.value, ar)) {
+                if (PutPath::put(w, rs, store, inc,
+                 req.key, req.value, ar)) {
+                    // STEP 1: replicate object
+                    if (!replicate_object(ar)) {
+                        std::cerr << "Replication failed\n";
+                        continue;
+                    }
 
+                    // STEP 2: commit locally (after majority)
                     pthread_mutex_lock(&apply_mtx);
                     apply_q.push(ar);
                     pthread_mutex_unlock(&apply_mtx);
                     pthread_cond_signal(&apply_cv);
                 }
+
             }
         }
     }
@@ -189,4 +225,31 @@ struct Replica {
         // Join apply thread
         pthread_join(apply_thread, nullptr);
     }
+
+    bool replicate_object(const ApplyRecord& ar) {
+
+        size_t ack = 1; // leader counts
+
+        Segment* leader_seg = store.segments[ar.seg_idx];
+
+        ObjectEntry obj = leader_seg->entries[ar.obj_idx];
+
+        for (size_t i = 0; i < followers.size(); ++i) {
+
+            Segment* fseg = followers[i]->store.segments[ar.seg_idx];
+
+            uint64_t tail = fseg->meta.tail_idx.load(std::memory_order_acquire);
+
+            // copy object
+            fseg->entries[tail] = obj;
+
+            // publish
+            fseg->meta.tail_idx.store(tail + 1, std::memory_order_release);
+
+            ack++;
+        }
+
+        return ack >= quorum;
+    }
+
 };
