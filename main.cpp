@@ -2,31 +2,60 @@
 #include <unistd.h>
 #include "replica/replica.hpp"
 
-int main() {
+int main(int argc, char** argv) {
 
-    std::cout << "🚀 Starting LoLKV...\n";
+    if (argc < 3) {
+        std::cout << "Usage:\n";
+        std::cout << "Leader  : ./node leader <port> <peer_port1> <peer_port2> ...\n";
+        std::cout << "Follower: ./node follower <port>\n";
+        return 0;
+    }
 
-    // 3 total replicas (1 leader + 2 followers)
-    Replica leader(1, 4, 3);
+    std::string mode = argv[1];
+    int port = std::stoi(argv[2]);
 
-    leader.submit_put("key", {1,2,3});
-    leader.submit_put("key", {4,5,6});
+    if (mode == "leader") {
 
-    // allow worker/apply threads to run
-    usleep(200000); // 200ms
+        std::vector<int> peers;
 
-    leader.shutdown();
+        for (int i = 3; i < argc; i++)
+            peers.push_back(std::stoi(argv[i]));
 
-    ObjectEntry* e = leader.get("key");
+        Replica leader(
+            1,
+            4,
+            Role::LEADER,
+            port,
+            peers
+        );
 
-    if (e) {
-        std::cout << "✅ SUCCESS:\n";
-        std::cout << "Term = " << e->term_id << "\n";
-        std::cout << "Seq  = " << e->seq_num << "\n";
-        std::cout << "Inc  = " << e->incarnation << "\n";
-        std::cout << "Size = " << e->value.size() << "\n";
-    } else {
-        std::cout << "❌ FAILED: Key not found!\n";
+        leader.submit_put("key", {1,2,3});
+        leader.submit_put("key", {4,5,6});
+
+        usleep(500000);
+
+        leader.shutdown();
+
+        ObjectEntry* e = leader.get("key");
+        if (e) {
+            std::cout << "SUCCESS\n";
+            std::cout << "Term = " << e->term_id << "\n";
+            std::cout << "Seq  = " << e->seq_num << "\n";
+            std::cout << "Inc  = " << e->incarnation << "\n";
+        }
+
+    } else if (mode == "follower") {
+
+        Replica follower(
+            2,
+            2,
+            Role::FOLLOWER,
+            port,
+            {}
+        );
+
+        while (true)
+            sleep(10);
     }
 
     return 0;

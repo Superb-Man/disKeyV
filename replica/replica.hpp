@@ -12,6 +12,8 @@
 #include "../storage/segment_store.hpp"
 #include "../index/hash_table.hpp"
 #include "../concurrency/incarnation.hpp"
+#include "../network/socket_utils.hpp"
+#include "../network/message.hpp"
 
 enum class OpType { PUT };
 
@@ -31,6 +33,8 @@ struct Follower {
         : id(rid),
           store(nseg, cap) {}
 };
+
+enum class Role { LEADER, FOLLOWER };
 
 
 struct Replica {
@@ -56,33 +60,122 @@ struct Replica {
     bool shutdown_called;
 
     // Replication
-    size_t replica_count;
-    size_t quorum; // number of replicas required for majority
-    std::vector<Follower*> followers;
+    // size_t replica_count;
+    // size_t quorum; // number of replicas required for majority
+    // std::vector<Follower*> followers;
+    Role role;
+    int server_sock;
+    std::vector<int> peer_socks;
+    size_t quorum;
 
-    Replica(uint64_t rid, int nworkers, size_t total_replicas)
+    pthread_t net_thread;
+
+    Replica(uint64_t rid,
+            int nworkers,
+            Role r,
+            int port,
+            const std::vector<int>& peer_ports)
         : rs(rid),
-        store(32, 1024),
+        store(32,1024),
         ht(4096),
         inc(2048),
+        role(r),
         stop(false),
-        shutdown_called(false),
-        replica_count(total_replicas),
-        quorum((total_replicas / 2) + 1)
-    {
+        shutdown_called(false) {
         pthread_mutex_init(&req_mtx, nullptr);
+    
         pthread_cond_init(&req_cv, nullptr);
 
         pthread_mutex_init(&apply_mtx, nullptr);
         pthread_cond_init(&apply_cv, nullptr);
 
-        for (size_t i = 1; i < replica_count; ++i) {
-            followers.push_back(new Follower(i, 32, 1024));
+        server_sock = create_server(port);
+
+        if (role == Role::LEADER) {
+            for (int p : peer_ports) {
+                int sock = -1;
+                while (sock < 0) {
+                    sock = connect_to("127.0.0.1", p);
+
+                    if (sock < 0) {
+                        std::cout << "waiting for follower on port " << p << "...\n";
+                        usleep(500000);
+                    }
+                }
+
+                std::cout << "connected to follower on port " << p << "\n";
+                peer_socks.push_back(sock);
+            }
+
+            quorum = (peer_socks.size() + 1) / 2 + 1;
         }
 
         start_workers(nworkers);
         start_apply_thread();
+
+        start_network_thread();
     }
+
+    static void* net_entry(void* arg) {
+        reinterpret_cast<Replica*>(arg)->network_loop();
+        return nullptr;
+    }
+
+    void start_network_thread() {
+        pthread_create(&net_thread, nullptr, net_entry, this);
+    }
+
+    void network_loop() {
+        while (!stop) {
+            sockaddr_in client_addr{};
+            socklen_t len = sizeof(client_addr);
+
+            int client = accept(server_sock,
+                                (sockaddr*)&client_addr,
+                                &len);
+
+            if (client < 0) continue;
+
+            handle_connection(client);
+            close(client);
+        }
+    }
+
+    void handle_connection(int sock) {
+
+        while (true) {
+
+            NetMessage msg;
+
+            if (!recv_message(sock, msg))
+                break;  // client disconnected
+
+            if (msg.type == MsgType::PUT_REPL) {
+
+                ApplyRecord ar;
+
+                if (!PutPath::put_replicated(
+                        rs,
+                        store,
+                        msg.key,
+                        msg.value,
+                        msg.term,
+                        msg.seq,
+                        msg.incarnation,
+                        ar))
+                    continue;
+
+                pthread_mutex_lock(&apply_mtx);
+                apply_q.push(ar);
+                pthread_mutex_unlock(&apply_mtx);
+                pthread_cond_signal(&apply_cv);
+
+                uint8_t ack = (uint8_t)MsgType::ACK;
+                send_all(sock, &ack, 1);
+            }
+        }
+    }
+
 
 
     ~Replica() {
@@ -94,11 +187,11 @@ struct Replica {
         pthread_mutex_destroy(&apply_mtx);
         pthread_cond_destroy(&apply_cv);
 
-        for (Follower* f : followers) {
-            delete f;
-        }
+        // for (Follower* f : followers) {
+        //     delete f;
+        // }
 
-        followers.clear();
+        // followers.clear();
     }
 
     static void* worker_entry(void* arg) {
@@ -139,23 +232,23 @@ struct Replica {
             pthread_mutex_unlock(&req_mtx);
 
             if (req.type == OpType::PUT) {
+
                 ApplyRecord ar;
                 if (PutPath::put(w, rs, store, inc,
-                 req.key, req.value, ar)) {
-                    // STEP 1: replicate object
-                    if (!replicate_object(ar)) {
-                        std::cerr << "Replication failed\n";
-                        continue;
+                                req.key, req.value, ar)) {
+
+                    if (role == Role::LEADER) {
+
+                        if (!replicate_to_followers(ar)) continue;
                     }
 
-                    // STEP 2: commit locally (after majority)
                     pthread_mutex_lock(&apply_mtx);
                     apply_q.push(ar);
                     pthread_mutex_unlock(&apply_mtx);
                     pthread_cond_signal(&apply_cv);
                 }
-
             }
+
         }
     }
 
@@ -224,32 +317,66 @@ struct Replica {
 
         // Join apply thread
         pthread_join(apply_thread, nullptr);
+
+        // close(server_sock);
     }
 
-    bool replicate_object(const ApplyRecord& ar) {
+    // bool replicate_object(const ApplyRecord& ar) {
 
-        size_t ack = 1; // leader counts
+    //     size_t ack = 1; // leader counts
 
+    //     Segment* leader_seg = store.segments[ar.seg_idx];
+
+    //     ObjectEntry obj = leader_seg->entries[ar.obj_idx];
+
+    //     for (size_t i = 0; i < followers.size(); ++i) {
+
+    //         Segment* fseg = followers[i]->store.segments[ar.seg_idx];
+
+    //         uint64_t tail = fseg->meta.tail_idx.load(std::memory_order_acquire);
+
+    //         // copy object
+    //         fseg->entries[tail] = obj;
+
+    //         // publish
+    //         fseg->meta.tail_idx.store(tail + 1, std::memory_order_release);
+
+    //         ack++;
+    //     }
+
+    //     return ack >= quorum;
+    // }
+    bool replicate_to_followers(const ApplyRecord& ar) {
         Segment* leader_seg = store.segments[ar.seg_idx];
+        ObjectEntry& obj = leader_seg->entries[ar.obj_idx];
 
-        ObjectEntry obj = leader_seg->entries[ar.obj_idx];
+        NetMessage msg;
+        msg.type = MsgType::PUT_REPL;
+        msg.term = obj.term_id;
+        msg.seq = obj.seq_num;
+        msg.incarnation = obj.incarnation;
+        msg.key = std::string(obj.key);
+        msg.value = obj.value;
 
-        for (size_t i = 0; i < followers.size(); ++i) {
+        size_t ack_count = 1; // count self
 
-            Segment* fseg = followers[i]->store.segments[ar.seg_idx];
-
-            uint64_t tail = fseg->meta.tail_idx.load(std::memory_order_acquire);
-
-            // copy object
-            fseg->entries[tail] = obj;
-
-            // publish
-            fseg->meta.tail_idx.store(tail + 1, std::memory_order_release);
-
-            ack++;
+        for (int s : peer_socks) {
+            std::cout << "Sending replication to follower socket " << s << "...\n";
+            if (send_message(s, msg)) {
+                uint8_t ack;
+                if (recv_all(s, &ack, 1) && ack == (uint8_t)MsgType::ACK) {
+                    ack_count++;
+                    std::cout << "Received ACK from follower socket " << s << "\n";
+                }
+            }
         }
 
-        return ack >= quorum;
+
+        std::cout << " quorum = " << quorum << ", ack_count = " << ack_count << "\n";
+        std::cout << "Peers: " << peer_socks.size() << "\n";
+
+        return ack_count >= quorum;
     }
+
 
 };
