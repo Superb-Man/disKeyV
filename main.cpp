@@ -28,21 +28,24 @@ int main(int argc, char** argv) {
             port,
             peers
         );
-
-        leader.submit_put("key", {1,2,3});
-        leader.submit_put("key", {4,5,6});
-
-        usleep(500000);
-
-        leader.shutdown();
-
-        ObjectEntry* e = leader.get("key");
-        if (e) {
-            std::cout << "SUCCESS\n";
-            std::cout << "Term = " << e->term_id << "\n";
-            std::cout << "Seq  = " << e->seq_num << "\n";
-            std::cout << "Inc  = " << e->incarnation << "\n";
+        while (true) {
+            // sleep(10);
         }
+
+        // leader.submit_put("key", {1,2,3});
+        // leader.submit_put("key", {4,5,6});
+
+        // usleep(500000);
+
+        // leader.shutdown();
+
+        // ObjectEntry* e = leader.get("key");
+        // if (e) {
+        //     std::cout << "SUCCESS\n";
+        //     std::cout << "Term = " << e->term_id << "\n";
+        //     std::cout << "Seq  = " << e->seq_num << "\n";
+        //     std::cout << "Inc  = " << e->incarnation << "\n";
+        // }
 
     } else if (mode == "follower") {
 
@@ -54,8 +57,8 @@ int main(int argc, char** argv) {
             {}
         );
 
-        while (true)
-            sleep(10);
+        while (true){}
+            // sleep(10);
     }
 
     return 0;

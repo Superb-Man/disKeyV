@@ -5,10 +5,15 @@
 #include "socket_utils.hpp"
 
 enum class MsgType : uint8_t {
-    CLIENT_PUT = 1,
-    PUT_REPL = 2,
-    ACK = 3
+    PUT_REPL = 1,
+    ACK      = 2,
+
+    CLIENT_PUT = 3,
+    CLIENT_GET = 4,
+    CLIENT_GET_REPLY = 5,
+    CLIENT_PUT_REPLY = 6
 };
+
 
 struct NetMessage {
     MsgType type;
