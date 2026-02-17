@@ -5,7 +5,8 @@
 #include <string>
 #include <iostream>
 #include <atomic>
-#include <unistd.h> 
+#include <unordered_map>
+#include <unistd.h>
 
 #include "replica_state.hpp"
 #include "../engine/worker.hpp"
@@ -16,15 +17,25 @@
 #include "../network/socket_utils.hpp"
 #include "../network/message.hpp"
 
-enum class OpType { PUT };
+enum class OpType { PUT, TX_PUT };
 
 struct Request {
     OpType type;
     std::string key;
     std::vector<uint8_t> value;
+    uint64_t tx_id = 0;
+    std::vector<TxKeyValue> kv_pairs;
 };
 
 enum class Role { LEADER, FOLLOWER };
+
+struct PendingTx {
+    std::vector<TxKeyValue> staged_kv;
+    uint64_t term;
+    uint64_t seq;
+    uint64_t incarnation;
+    std::atomic<bool> prepared{false};
+};
 
 struct Replica {
     ReplicaState rs;
@@ -32,46 +43,30 @@ struct Replica {
     HashTable ht;
     IncarnationTable inc;
 
-    // Worker side
     std::vector<pthread_t> workers;
     std::queue<Request> req_q;
-    pthread_mutex_t req_mtx;
-    pthread_cond_t req_cv;
+    pthread_mutex_t req_mtx = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t req_cv = PTHREAD_COND_INITIALIZER;
 
-    // Apply side
     pthread_t apply_thread;
     std::queue<ApplyRecord> apply_q;
-    pthread_mutex_t apply_mtx;
-    pthread_cond_t apply_cv;
+    pthread_mutex_t apply_mtx = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t apply_cv = PTHREAD_COND_INITIALIZER;
 
-    // Control
+    std::unordered_map<uint64_t, PendingTx> pending_txs;
+    pthread_mutex_t tx_mtx = PTHREAD_MUTEX_INITIALIZER;
+
     bool stop = false;
     bool shutdown_called = false;
-
-    // Network
     Role role;
     int server_sock;
     std::vector<int> peer_ports;
     size_t quorum;
-
     pthread_t net_thread;
+    static std::atomic<uint64_t> global_tx_id;
 
-    Replica(uint64_t rid,
-            int nworkers,
-            Role r,
-            int port,
-            const std::vector<int>& peer_ports_list)
-        : rs(rid),
-          store(32, 1024),
-          ht(4096),
-          inc(2048),
-          role(r),
-          peer_ports(peer_ports_list) {
-
-        pthread_mutex_init(&req_mtx, nullptr);
-        pthread_cond_init(&req_cv, nullptr);
-        pthread_mutex_init(&apply_mtx, nullptr);
-        pthread_cond_init(&apply_cv, nullptr);
+    Replica(uint64_t rid, int nworkers, Role r, int port, const std::vector<int>& peer_ports_list)
+        : rs(rid), store(32, 1024), ht(4096), inc(2048), role(r), peer_ports(peer_ports_list) {
 
         server_sock = create_server(port);
         std::cout << "[Replica " << rid << "] Listening on port " << port 
@@ -90,10 +85,14 @@ struct Replica {
 
     ~Replica() {
         shutdown();
-        pthread_mutex_destroy(&req_mtx);
-        pthread_cond_destroy(&req_cv);
-        pthread_mutex_destroy(&apply_mtx);
-        pthread_cond_destroy(&apply_cv);
+    }
+
+    // Generate proper metadata and write locally
+    ApplyRecord write_local(const std::string& key, const std::vector<uint8_t>& value) {
+        Worker dummy(0);
+        ApplyRecord ar;
+        PutPath::put(dummy, rs, store, inc, key, value, ar);
+        return ar;
     }
 
     // Network thread entry point
@@ -190,17 +189,83 @@ struct Replica {
             uint8_t ack = static_cast<uint8_t>(MsgType::ACK);
             send_all(sock, &ack, 1);
             std::cout << "[Replication] ACK sent\n";
+
+        } else if (msg.type == MsgType::CLIENT_TX_PUT) {
+            if (role != Role::LEADER) {
+                std::cout << "[Client] Rejected TX_PUT request: this node is not the leader\n";
+                close(sock);
+                return;
+            }
+
+            std::cout << "[Client] Processing TX_PUT for " << msg.kv_pairs.size() << " keys\n";
+            bool success = submit_tx_put(msg.kv_pairs);
+
+            NetMessage reply;
+            reply.type = MsgType::CLIENT_TX_PUT_REPLY;
+            reply.term = success ? 1 : 0;
+            send_message(sock, reply);
+            std::cout << "[Client] Sent TX_PUT reply (" 
+                      << (success ? "COMMITTED" : "ABORTED") << ")\n";
+
+        } else if (msg.type == MsgType::TX_PREPARE) {
+            std::cout << "[2PL] Received TX_PREPARE for tx_id=" << msg.tx_id 
+                      << " with " << msg.kv_pairs.size() << " keys\n";
+
+            pthread_mutex_lock(&tx_mtx);
+            PendingTx& pt = pending_txs[msg.tx_id];
+            pt.staged_kv = msg.kv_pairs;
+            pt.term = msg.term;
+            pt.seq = msg.seq;
+            pt.incarnation = msg.incarnation;
+            pt.prepared.store(true);
+            pthread_mutex_unlock(&tx_mtx);
+
+            NetMessage reply;
+            reply.type = MsgType::TX_PREPARE_OK;
+            reply.tx_id = msg.tx_id;
+            send_message(sock, reply);
+            std::cout << "[2PL] Sent TX_PREPARE_OK\n";
+
+        } else if (msg.type == MsgType::TX_COMMIT) {
+            std::cout << "[2PL] Received TX_COMMIT for tx_id=" << msg.tx_id << "\n";
+
+            pthread_mutex_lock(&tx_mtx);
+            auto it = pending_txs.find(msg.tx_id);
+            if (it != pending_txs.end()) {
+                const PendingTx& pt = it->second;
+                for (const auto& kv : pt.staged_kv) {
+                    ApplyRecord ar;
+                    if (PutPath::put_replicated(rs, store, kv.key, kv.value,
+                                               pt.term, pt.seq, pt.incarnation, ar)) {
+                        pthread_mutex_lock(&apply_mtx);
+                        apply_q.push(ar);
+                        pthread_mutex_unlock(&apply_mtx);
+                        pthread_cond_signal(&apply_cv);
+                    }
+                }
+                pending_txs.erase(it);
+                std::cout << "[2PL] Committed transaction\n";
+            }
+            pthread_mutex_unlock(&tx_mtx);
+
+            uint8_t ack = static_cast<uint8_t>(MsgType::ACK);
+            send_all(sock, &ack, 1);
+            std::cout << "[2PL] Sent COMMIT ACK\n";
+
+        } else if (msg.type == MsgType::TX_ABORT) {
+            std::cout << "[2PL] Received TX_ABORT for tx_id=" << msg.tx_id << "\n";
+
+            pthread_mutex_lock(&tx_mtx);
+            pending_txs.erase(msg.tx_id);
+            pthread_mutex_unlock(&tx_mtx);
+
+            uint8_t ack = static_cast<uint8_t>(MsgType::ACK);
+            send_all(sock, &ack, 1);
+            std::cout << "[2PL] Sent ABORT ACK\n";
         }
 
         close(sock);
         std::cout << "[Network] Connection closed\n";
-    }
-
-    size_t pending_apply() {
-        pthread_mutex_lock(&apply_mtx);
-        size_t s = apply_q.size();
-        pthread_mutex_unlock(&apply_mtx);
-        return s;
     }
 
     // Worker thread 
@@ -245,9 +310,8 @@ struct Replica {
             req_q.pop();
             pthread_mutex_unlock(&req_mtx);
 
-            std::cout << "[Worker " << w.worker_id << "] Processing PUT for key: " << req.key << "\n";
-
             if (req.type == OpType::PUT) {
+                std::cout << "[Worker " << w.worker_id << "] Processing PUT for key: " << req.key << "\n";
                 ApplyRecord ar;
                 if (PutPath::put(w, rs, store, inc, req.key, req.value, ar)) {
                     if (role == Role::LEADER) {
@@ -313,6 +377,72 @@ struct Replica {
         pthread_cond_signal(&req_cv);
     }
 
+    bool submit_tx_put(const std::vector<TxKeyValue>& kv_pairs) {
+        if (role != Role::LEADER) return false;
+
+        // Step 1: Generate all metadata locally (ensures consistent incarnations)
+        std::vector<ApplyRecord> ars;
+        std::vector<NetMessage> repl_msgs;
+        
+        Worker dummy_worker(0);
+        for (const auto& kv : kv_pairs) {
+            ApplyRecord ar;
+            if (!PutPath::put(dummy_worker, rs, store, inc, kv.key, kv.value, ar)) {
+                return false;
+            }
+            ars.push_back(ar);
+            
+            // Build replication message (same as single-key)
+            Segment* seg = store.segments[ar.seg_idx];
+            ObjectEntry& obj = seg->entries[ar.obj_idx];
+            NetMessage msg;
+            msg.type = MsgType::PUT_REPL;
+            msg.term = obj.term_id;
+            msg.seq = obj.seq_num;
+            msg.incarnation = obj.incarnation;
+            msg.key = kv.key;
+            msg.value = kv.value;
+            repl_msgs.push_back(msg);
+        }
+
+        // Step 2: Replicate all keys to followers (same path as single-key)
+        size_t total_keys = kv_pairs.size();
+        size_t total_acks = 0;
+        
+        for (size_t i = 0; i < total_keys; i++) {
+            size_t ack_count = 1; // Leader counts itself
+            
+            for (int port : peer_ports) {
+                int sock = connect_to("127.0.0.1", port);
+                if (sock >= 0) {
+                    if (send_message(sock, repl_msgs[i])) {
+                        uint8_t ack;
+                        if (recv_all(sock, &ack, 1) && ack == static_cast<uint8_t>(MsgType::ACK)) {
+                            ack_count++;
+                        }
+                    }
+                    close(sock);
+                }
+            }
+            
+            // Check quorum for this key
+            if (ack_count < quorum) {
+                return false; // Abort entire transaction
+            }
+            total_acks += ack_count;
+        }
+
+        // Step 3: Apply all keys locally (since all replicated successfully)
+        for (const auto& ar : ars) {
+            pthread_mutex_lock(&apply_mtx);
+            apply_q.push(ar);
+            pthread_mutex_unlock(&apply_mtx);
+            pthread_cond_signal(&apply_cv);
+        }
+        
+        return true;
+    }
+
     ObjectEntry* get(const std::string& k) {
         return ht.get(store, k);
     }
@@ -337,6 +467,7 @@ struct Replica {
             pthread_join(t, nullptr);
 
         pthread_join(apply_thread, nullptr);
+        pthread_join(net_thread, nullptr);
         close(server_sock);
         std::cout << "[Replica] Shutdown complete\n";
     }
@@ -386,3 +517,5 @@ struct Replica {
         return success;
     }
 };
+
+std::atomic<uint64_t> Replica::global_tx_id{0};

@@ -47,6 +47,7 @@ struct PutPath {
         return true;
     }
 
+    // engine/put_path.hpp
     static bool put_replicated(
         ReplicaState& rs,
         SegmentStore& store,
@@ -54,38 +55,28 @@ struct PutPath {
         const std::vector<uint8_t>& value,
         uint64_t term,
         uint64_t seq,
-        uint64_t incarnation,
+        uint64_t incarnation,  // ← Use this directly
         ApplyRecord& ar) {
-        // Select segment exactly same way leader does
+
         size_t h = std::hash<std::string>{}(key);
         size_t seg_idx = h % store.segments.size();
         Segment& seg = *store.segments[seg_idx];
 
-        // If segment not ACTIVE, try to acquire it
-        if (seg.meta.status.load(std::memory_order_acquire)
-            != (uint8_t)SegmentStatus::ACTIVE)
-        {
-            if (!store.try_acquire(seg,
-                                rs.replica_id,
-                                term))
+        if (seg.meta.status.load(std::memory_order_acquire) != (uint8_t)SegmentStatus::ACTIVE) {
+            if (!store.try_acquire(seg, rs.replica_id, term))
                 return false;
         }
 
-        // Create object using LEADER metadata
+        // Create object using LEADER'S metadata (no local incarnation!)
         ObjectEntry obj(term, seq, incarnation, key, value);
 
-        // Append to segment
         uint64_t idx = seg.append(obj);
-        if (idx == UINT64_MAX)
-            return false;
+        if (idx == UINT64_MAX) return false;
 
-        if (seg.is_full())
-            seg.seal();
+        if (seg.is_full()) seg.seal();
 
-        // Produce apply record
         ar.seg_idx = seg_idx;
         ar.obj_idx = idx;
-
         return true;
     }
 };
