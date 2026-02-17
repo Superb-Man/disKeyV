@@ -378,70 +378,126 @@ struct Replica {
     }
 
     bool submit_tx_put(const std::vector<TxKeyValue>& kv_pairs) {
-        if (role != Role::LEADER) return false;
+    	if (role != Role::LEADER) return false;
 
-        // Step 1: Generate all metadata locally (ensures consistent incarnations)
-        std::vector<ApplyRecord> ars;
-        std::vector<NetMessage> repl_msgs;
-        
-        Worker dummy_worker(0);
-        for (const auto& kv : kv_pairs) {
-            ApplyRecord ar;
-            if (!PutPath::put(dummy_worker, rs, store, inc, kv.key, kv.value, ar)) {
-                return false;
-            }
-            ars.push_back(ar);
-            
-            // Build replication message (same as single-key)
-            Segment* seg = store.segments[ar.seg_idx];
-            ObjectEntry& obj = seg->entries[ar.obj_idx];
-            NetMessage msg;
-            msg.type = MsgType::PUT_REPL;
-            msg.term = obj.term_id;
-            msg.seq = obj.seq_num;
-            msg.incarnation = obj.incarnation;
-            msg.key = kv.key;
-            msg.value = kv.value;
-            repl_msgs.push_back(msg);
-        }
+    	uint64_t tx_id = ++global_tx_id;
+    
+    	std::cout << "[Leader] Starting TX_PREPARE for tx_id=" << tx_id 
+              << " with " << kv_pairs.size() << " keys\n";
 
-        // Step 2: Replicate all keys to followers (same path as single-key)
-        size_t total_keys = kv_pairs.size();
-        size_t total_acks = 0;
+    	// Phase 1: Generate proper metadata per key AND stage locally
+    	std::vector<NetMessage> prepare_msgs;
+    	Worker dummy_worker(0);
+    
+   		for (const auto& kv : kv_pairs) {
+        // Generate correct metadata using incarnation table (same as single-key PUT)
+        	uint64_t seq = dummy_worker.sequence_number.fetch_add(1, std::memory_order_relaxed) + 1;
+        	uint64_t incarnation = inc.next(kv.key);
+        	uint64_t term = rs.current_term.load(std::memory_order_acquire);
         
-        for (size_t i = 0; i < total_keys; i++) {
-            size_t ack_count = 1; // Leader counts itself
-            
-            for (int port : peer_ports) {
-                int sock = connect_to("127.0.0.1", port);
-                if (sock >= 0) {
-                    if (send_message(sock, repl_msgs[i])) {
-                        uint8_t ack;
-                        if (recv_all(sock, &ack, 1) && ack == static_cast<uint8_t>(MsgType::ACK)) {
-                            ack_count++;
-                        }
-                    }
-                    close(sock);
-                }
-            }
-            
-            // Check quorum for this key
-            if (ack_count < quorum) {
-                return false; // Abort entire transaction
-            }
-            total_acks += ack_count;
-        }
+        	NetMessage msg;
+        	msg.type = MsgType::TX_PREPARE;
+        	msg.tx_id = tx_id;
+        	msg.term = term;
+        	msg.seq = seq;
+        	msg.incarnation = incarnation;
+        	msg.key = kv.key;
+        	msg.value = kv.value;
+        	msg.kv_pairs.push_back(kv); // For follower staging
+        	prepare_msgs.push_back(msg);
+    	}
 
-        // Step 3: Apply all keys locally (since all replicated successfully)
-        for (const auto& ar : ars) {
-            pthread_mutex_lock(&apply_mtx);
-            apply_q.push(ar);
-            pthread_mutex_unlock(&apply_mtx);
-            pthread_cond_signal(&apply_cv);
-        }
+    	// Stage locally on leader (same as followers will do)
+    	{
+        	pthread_mutex_lock(&tx_mtx);
+        	PendingTx& pt = pending_txs[tx_id];
+        	pt.staged_kv = kv_pairs;
+        	pt.term = prepare_msgs[0].term;
+        	pt.seq = prepare_msgs[0].seq;
+        	pt.incarnation = prepare_msgs[0].incarnation;
+        	pt.prepared.store(true);
+        	pthread_mutex_unlock(&tx_mtx);
+    	}
+
+    	// Send TX_PREPARE to all followers
+    	size_t prepare_ok_count = 1; // Leader counts itself
+    	for (size_t i = 0; i < peer_ports.size(); i++) {
+        	std::cout << "[Leader] Sending TX_PREPARE to follower on port " << peer_ports[i] << "\n";
+        	int sock = connect_to("127.0.0.1", peer_ports[i]);
+        	if (sock < 0) {
+            	std::cout << "[Leader] Failed to connect to follower on port " << peer_ports[i] << "\n";
+            	continue;
+        	}
         
-        return true;
-    }
+        	// Send ALL keys in one TX_PREPARE message
+        	NetMessage batch_msg;
+        	batch_msg.type = MsgType::TX_PREPARE;
+        	batch_msg.tx_id = tx_id;
+        	batch_msg.term = prepare_msgs[0].term;
+        	batch_msg.seq = prepare_msgs[0].seq;
+        	batch_msg.incarnation = prepare_msgs[0].incarnation;
+        	batch_msg.kv_pairs = kv_pairs; // All keys together
+        
+        	if (send_message(sock, batch_msg)) {
+            	NetMessage reply;
+            	if (recv_message(sock, reply) && reply.type == MsgType::TX_PREPARE_OK) {
+                	prepare_ok_count++;
+                	std::cout << "[Leader] Received TX_PREPARE_OK from follower on port " << peer_ports[i] << "\n";
+            	} else {
+                	std::cout << "[Leader] No TX_PREPARE_OK from follower on port " << peer_ports[i] << "\n";
+            	}
+        	} else {
+            	std::cout << "[Leader] Failed to send TX_PREPARE to port " << peer_ports[i] << "\n";
+        	}
+        	close(sock);
+    	}
+
+    	bool committed = (prepare_ok_count >= quorum);
+    	std::cout << "[Leader] TX_PREPARE phase complete. ACKs=" << prepare_ok_count 
+              << ", quorum=" << quorum << " -> " 
+              << (committed ? "COMMITTING" : "ABORTING") << "\n";
+
+    	// Phase 2: Send TX_COMMIT or TX_ABORT to all followers
+    	NetMessage decision_msg;
+    	decision_msg.tx_id = tx_id;
+    	decision_msg.type = committed ? MsgType::TX_COMMIT : MsgType::TX_ABORT;
+    
+    	for (int port : peer_ports) {
+        	std::cout << "[Leader] Sending " 
+                  << (committed ? "TX_COMMIT" : "TX_ABORT")
+                  << " to follower on port " << port << "\n";
+        	int sock = connect_to("127.0.0.1", port);
+        	if (sock >= 0) {
+            	send_message(sock, decision_msg);
+            	close(sock);
+        	}
+    	}
+
+    	// Leader applies only on commit (same as followers)
+    	if (committed) {
+        	std::cout << "[Leader] Applying transaction locally\n";
+        	pthread_mutex_lock(&tx_mtx);
+        	auto it = pending_txs.find(tx_id);
+        	if (it != pending_txs.end()) {
+            	const PendingTx& pt = it->second;
+            	for (const auto& kv : pt.staged_kv) {
+                	ApplyRecord ar;
+                	// Use the metadata we generated earlier
+                	if (PutPath::put_replicated(rs, store, kv.key, kv.value,
+                                           pt.term, pt.seq, pt.incarnation, ar)) {
+                    	pthread_mutex_lock(&apply_mtx);
+                    	apply_q.push(ar);
+                    	pthread_mutex_unlock(&apply_mtx);
+                    	pthread_cond_signal(&apply_cv);
+                	}
+            	}
+            	pending_txs.erase(it);
+        	}
+        	pthread_mutex_unlock(&tx_mtx);
+    	}
+
+    	return committed;
+	}
 
     ObjectEntry* get(const std::string& k) {
         return ht.get(store, k);
