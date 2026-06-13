@@ -18,32 +18,70 @@ struct PutPath {
         SegmentStore& store,
         IncarnationTable& inc,
         const std::string& key,
-        const std::vector<uint8_t>& value, ApplyRecord& out_apply) {
+        const std::vector<uint8_t>& value,
+        ApplyRecord& out_apply) {
 
-            uint64_t seq = w.sequence_number.fetch_add(1, std::memory_order_relaxed) + 1;
-            uint64_t incarnation = inc.next(key);
-            uint64_t term = rs.current_term.load(std::memory_order_acquire);
+        auto seq = w.sequence_number.fetch_add(1) + 1;
 
-            size_t h = std::hash<std::string>{}(key);
-            size_t seg_idx = h % store.segments.size();
-            Segment& seg = *store.segments[seg_idx];
+        auto incarnation = inc.next(key);
+        auto term = rs.current_term.load(std::memory_order_acquire);
 
-            if (seg.meta.status.load(std::memory_order_acquire)
-                != (uint8_t)SegmentStatus::ACTIVE) {
-                if (!store.try_acquire(seg, w.worker_id, term))
-                    return false;
+        auto seg_idx = w.active_segment.load(std::memory_order_acquire);
+
+        if (seg_idx == UINT64_MAX) {
+
+            auto new_seg = store.acquire_free_segment(w.worker_id, term);
+
+            if (new_seg < 0)
+                return false;
+
+            seg_idx = new_seg;
+
+            w.active_segment.store(seg_idx, std::memory_order_release);
         }
 
-        ObjectEntry obj(term, seq, incarnation, key, value);
-        uint64_t idx = seg.append(obj);
-        if (idx == UINT64_MAX)
-            return false;
+        Segment& seg = *store.segments[seg_idx];
+
+        ObjectEntry obj(
+            term,
+            seq,
+            incarnation,
+            key,
+            value);
+
+        auto idx = seg.append(obj);
+
+        if (idx == UINT64_MAX) {
+
+            seg.seal();
+            auto new_seg = store.acquire_free_segment(w.worker_id, term);
+
+            if (new_seg < 0)
+                return false;
+
+            w.active_segment.store(new_seg, std::memory_order_release);
+
+            Segment& next = *store.segments[new_seg];
+
+            idx = next.append(obj);
+
+            if (idx == UINT64_MAX)
+                return false;
+
+            out_apply = {
+                (size_t)new_seg, idx
+            };
+            return true;
+        }
 
         if (seg.is_full())
             seg.seal();
 
-        //produce apply record
-        out_apply = { seg_idx, idx };
+        out_apply = {
+            seg_idx,
+            idx
+        };
+
         return true;
     }
 

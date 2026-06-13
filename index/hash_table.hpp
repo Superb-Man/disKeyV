@@ -2,52 +2,74 @@
 #include <unordered_map>
 #include <string>
 #include "../storage/segment_store.hpp"
+#include <shared_mutex>
+#include <atomic>
+#include <mutex>
 
 using OffsetType = uint64_t;
 
 class HashTable {
     std::unordered_map<std::string, OffsetType> map;
+    mutable std::shared_mutex ht_mutex;
 
 public:
     HashTable(size_t) {}
 
     void apply(SegmentStore& store, size_t seg_idx, uint64_t obj_idx) {
-        if (seg_idx >= store.segments.size()) return;
-            Segment* seg = store.segments[seg_idx];
-            if (obj_idx >= seg->capacity) return;
 
-            // Acquire fence to see latest writes
-            std::atomic_thread_fence(std::memory_order_acquire);
-            
-            ObjectEntry& obj = seg->entries[obj_idx];
+        std::unique_lock<std::shared_mutex> lock(ht_mutex);
 
-            // validate key before use
-            char safe_key[65];
-            std::memcpy(safe_key, obj.key, 64);
-            safe_key[64] = '\0';
-            
-            // Skip if key is all zeros (uninitialized)
-            bool is_valid = false;
-            for (int i = 0; i < 64; i++) {
-                if (safe_key[i] != 0) {
-                    is_valid = true;
-                    break;
-                }
+        if (seg_idx >= store.segments.size())
+            return;
+
+        Segment* seg = store.segments[seg_idx];
+
+        if (obj_idx >= seg->capacity)
+            return;
+
+        std::atomic_thread_fence(std::memory_order_acquire);
+
+        ObjectEntry& obj = seg->entries[obj_idx];
+
+        char safe_key[65];
+
+        std::memcpy(safe_key, obj.key, 64);
+
+        safe_key[64] = '\0';
+
+        bool valid = false;
+
+        for (int i = 0; i < 64; i++) {
+
+            if (safe_key[i] != 0) {
+                valid = true;
+                break;
             }
-            if (!is_valid) return;
+        }
+
+        if (!valid)
+            return;
 
         auto it = map.find(obj.key);
+
         if (it == map.end()) {
-            map[obj.key] = (seg_idx << 32) | obj_idx;
+
+            map[obj.key] = ((uint64_t)seg_idx << 32) | obj_idx;
+
             return;
         }
 
-        
-        ObjectEntry* old = &store.segments[it->second >> 32]->entries[it->second & 0xffffffff];
+        auto packed = it->second;
 
-        if (std::tie(obj.term_id, obj.incarnation, obj.seq_num) >
-            std::tie(old->term_id, old->incarnation, old->seq_num)) {
-            map[obj.key] = (seg_idx << 32) | obj_idx;
+        auto old_seg = packed >> 32;
+
+        auto old_idx = packed & 0xffffffffULL;
+
+        ObjectEntry* old = &store.segments[old_seg]->entries[old_idx];
+
+        if (std::tie(obj.term_id, obj.incarnation)>std::tie(old->term_id, old->incarnation)) {
+
+            map[obj.key] =((uint64_t)seg_idx << 32) | obj_idx;
         }
     }
     
@@ -57,25 +79,33 @@ public:
      * @param k The key to look up.
      * @return Pointer to the ObjectEntry if found, nullptr otherwise.
      */
-    ObjectEntry* get(SegmentStore& store, const std::string& k) {
-        auto it = map.find(k);
-        if (it == map.end()) return nullptr;
+    ObjectEntry* get(SegmentStore& store, const std::string& key) {
+        std::shared_lock<std::shared_mutex>lock(ht_mutex);
 
-        OffsetType packed = it->second;
-        size_t seg_idx = static_cast<size_t>(packed >> 32);
-        uint64_t obj_idx = static_cast<uint64_t>(packed & 0xFFFFFFFFULL);
+        auto it = map.find(key);
 
-        if (seg_idx >= store.segments.size()) return nullptr;
-        if (obj_idx >= store.segments[seg_idx]->capacity) return nullptr;
+        if (it == map.end())
+            return nullptr;
+
+        auto packed = it->second;
+
+        auto seg_idx = packed >> 32;
+
+        auto obj_idx = packed & 0xffffffffULL;
+
+        if (seg_idx >= store.segments.size())
+            return nullptr;
+
+        if (obj_idx >= store.segments[seg_idx]->capacity)
+            return nullptr;
 
         std::atomic_thread_fence(std::memory_order_acquire);
-        ObjectEntry& obj = store.segments[seg_idx]->entries[obj_idx];
-        
-        // Validate key matches requested key
-        if (std::string(obj.key, k.size()) != k) {
+
+        auto& obj = store.segments[seg_idx]->entries[obj_idx];
+
+        if (std::string(obj.key, key.size()) != key)
             return nullptr;
-        }
-        
+
         return &obj;
     }
 };
