@@ -36,6 +36,11 @@
 *.exe
 *.out
 *.app
+diskeyv-server
+diskeyv-client
+
+# Build directories
+/build*/
 
 # debug information files
 *.dwo

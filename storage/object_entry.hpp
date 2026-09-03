@@ -2,8 +2,11 @@
 #include <vector>
 #include <cstring>
 #include <string>
+#include <algorithm>
 
 struct ObjectEntry {
+    static constexpr size_t kMaxKeySize = 63;
+
     uint64_t term_id;
     uint64_t seq_num;
     uint64_t incarnation;
@@ -27,7 +30,7 @@ struct ObjectEntry {
                 const std::vector<uint8_t>& v)
         : term_id(t), seq_num(s), incarnation(i), value(v) {
         std::memset(key, 0, sizeof(key));
-        std::memcpy(key, k.c_str(), std::min(k.size(), sizeof(key) - 1));
+        std::memcpy(key, k.data(), std::min(k.size(), kMaxKeySize));
     }
 
     ObjectEntry& operator=(const ObjectEntry& other) {

@@ -1,8 +1,21 @@
 #include <iostream>
+#include <csignal>
 #include <unistd.h>
 #include "replica/replica.hpp"
 
+namespace {
+volatile std::sig_atomic_t shutdown_requested = 0;
+
+void request_shutdown(int) {
+    shutdown_requested = 1;
+}
+}
+
 int main(int argc, char** argv) {
+
+    std::signal(SIGINT, request_shutdown);
+    std::signal(SIGTERM, request_shutdown);
+    std::signal(SIGPIPE, SIG_IGN);
 
     if (argc < 3) {
         std::cout << "Usage:\n";
@@ -28,24 +41,8 @@ int main(int argc, char** argv) {
             port,
             peers
         );
-        while (true) {
-            // sleep(10);
-        }
-
-        // leader.submit_put("key", {1,2,3});
-        // leader.submit_put("key", {4,5,6});
-
-        // usleep(500000);
-
-        // leader.shutdown();
-
-        // ObjectEntry* e = leader.get("key");
-        // if (e) {
-        //     std::cout << "SUCCESS\n";
-        //     std::cout << "Term = " << e->term_id << "\n";
-        //     std::cout << "Seq  = " << e->seq_num << "\n";
-        //     std::cout << "Inc  = " << e->incarnation << "\n";
-        // }
+        while (!shutdown_requested) sleep(1);
+        leader.shutdown();
 
     } else if (mode == "follower") {
 
@@ -57,8 +54,11 @@ int main(int argc, char** argv) {
             {}
         );
 
-        while (true){}
-            // sleep(10);
+        while (!shutdown_requested) sleep(1);
+        follower.shutdown();
+    } else {
+        std::cerr << "Unknown role: " << mode << "\n";
+        return 1;
     }
 
     return 0;

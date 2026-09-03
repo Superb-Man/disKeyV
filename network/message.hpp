@@ -1,139 +1,165 @@
 #pragma once
+
+#include <arpa/inet.h>
 #include <cstdint>
 #include <string>
 #include <vector>
+
 #include "socket_utils.hpp"
-
-// In network/message.hpp
-struct TxKeyValue {
-    std::string key;
-    std::vector<uint8_t> value;
-
-    // Default constructor
-    TxKeyValue() = default;
-
-    // Constructor from pair
-    TxKeyValue(const std::pair<std::string, std::vector<uint8_t>>& p)
-        : key(p.first), value(p.second) {}
-
-    // ✅ NEW: Constructor from key and value
-    TxKeyValue(std::string k, std::vector<uint8_t> v)
-        : key(std::move(k)), value(std::move(v)) {}
-
-    // Implicit conversion to pair
-    operator std::pair<std::string, std::vector<uint8_t>>() const {
-        return {key, value};
-    }
-};
 
 enum class MsgType : uint8_t {
     PUT_REPL = 1,
-    ACK      = 2,
-
+    ACK = 2,
     CLIENT_PUT = 3,
     CLIENT_GET = 4,
     CLIENT_GET_REPLY = 5,
-    CLIENT_PUT_REPLY = 6,
-
-    TX_PREPARE = 10,
-    TX_COMMIT = 11,
-    TX_ABORT = 12,
-    TX_PREPARE_OK = 13,
-    TX_PREPARE_FAIL = 14,
-    CLIENT_TX_PUT = 15,
-    CLIENT_TX_PUT_REPLY = 16
+    CLIENT_PUT_REPLY = 6
 };
 
+enum class OperationStatus : uint8_t {
+    OK = 0,
+    NOT_FOUND = 1,
+    NOT_LEADER = 2,
+    NO_QUORUM = 3,
+    OUT_OF_SPACE = 4,
+    INVALID_REQUEST = 5,
+    STORAGE_ERROR = 6,
+    SHUTTING_DOWN = 7
+};
+
+inline const char* status_name(OperationStatus status) {
+    switch (status) {
+        case OperationStatus::OK: return "OK";
+        case OperationStatus::NOT_FOUND: return "NOT_FOUND";
+        case OperationStatus::NOT_LEADER: return "NOT_LEADER";
+        case OperationStatus::NO_QUORUM: return "NO_QUORUM";
+        case OperationStatus::OUT_OF_SPACE: return "OUT_OF_SPACE";
+        case OperationStatus::INVALID_REQUEST: return "INVALID_REQUEST";
+        case OperationStatus::STORAGE_ERROR: return "STORAGE_ERROR";
+        case OperationStatus::SHUTTING_DOWN: return "SHUTTING_DOWN";
+    }
+    return "UNKNOWN";
+}
 
 struct NetMessage {
-    MsgType type;
-    uint64_t term;
-    uint64_t seq;
-    uint64_t incarnation;
+    MsgType type{MsgType::ACK};
+    OperationStatus status{OperationStatus::OK};
+    uint64_t term{0};
+    uint64_t seq{0};
+    uint64_t incarnation{0};
+    uint64_t worker_id{0};
+    uint64_t segment_index{0};
+    uint64_t object_index{0};
     std::string key;
     std::vector<uint8_t> value;
-
-    uint64_t tx_id = 0;
-    std::vector<TxKeyValue> kv_pairs;
 };
 
-inline bool send_message(int sock, const NetMessage& msg) {
-    uint8_t type = (uint8_t)msg.type;
-    if (!send_all(sock, &type, 1)) return false;
-    if (!send_all(sock, &msg.term, 8)) return false;
-    if (!send_all(sock, &msg.seq, 8)) return false;
-    if (!send_all(sock, &msg.incarnation, 8)) return false;
+constexpr uint32_t kProtocolMagic = 0x444b5631U;
+constexpr uint16_t kProtocolVersion = 1;
+constexpr uint32_t kMaxWireKeySize = 63;
+constexpr uint32_t kMaxWireValueSize = 1024U * 1024U;
 
-    uint32_t ksz = msg.key.size();
-    uint32_t vsz = msg.value.size();
-    if (!send_all(sock, &ksz, 4)) return false;
-    if (!send_all(sock, &vsz, 4)) return false;
-    if (!send_all(sock, msg.key.data(), ksz)) return false;
-    if (!send_all(sock, msg.value.data(), vsz)) return false;
+inline uint64_t host_to_network_u64(uint64_t value) {
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    return (static_cast<uint64_t>(htonl(static_cast<uint32_t>(value))) << 32U) |
+           htonl(static_cast<uint32_t>(value >> 32U));
+#else
+    return value;
+#endif
+}
 
-    // Send tx_id for ALL transaction messages
-    if (msg.type == MsgType::TX_PREPARE || 
-        msg.type == MsgType::TX_COMMIT || 
-        msg.type == MsgType::TX_ABORT ||
-        msg.type == MsgType::CLIENT_TX_PUT) {
-        if (!send_all(sock, &msg.tx_id, 8)) return false;
-        
-        // Only TX_PREPARE and CLIENT_TX_PUT have kv_pairs
-        if (msg.type == MsgType::TX_PREPARE || msg.type == MsgType::CLIENT_TX_PUT) {
-            uint32_t kv_count = msg.kv_pairs.size();
-            if (!send_all(sock, &kv_count, 4)) return false;
-            for (const auto& kv : msg.kv_pairs) {
-                uint32_t ksize = kv.key.size();
-                uint32_t vsize = kv.value.size();
-                if (!send_all(sock, &ksize, 4)) return false;
-                if (!send_all(sock, &vsize, 4)) return false;
-                if (!send_all(sock, kv.key.data(), ksize)) return false;
-                if (!send_all(sock, kv.value.data(), vsize)) return false;
-            }
-        }
-    }
+inline uint64_t network_to_host_u64(uint64_t value) {
+    return host_to_network_u64(value);
+}
+
+inline bool valid_message_type(uint8_t type) {
+    return type >= static_cast<uint8_t>(MsgType::PUT_REPL) &&
+           type <= static_cast<uint8_t>(MsgType::CLIENT_PUT_REPLY);
+}
+
+inline bool send_u64(int sock, uint64_t value) {
+    const uint64_t wire = host_to_network_u64(value);
+    return send_all(sock, &wire, sizeof(wire));
+}
+
+inline bool recv_u64(int sock, uint64_t& value) {
+    uint64_t wire = 0;
+    if (!recv_all(sock, &wire, sizeof(wire))) return false;
+    value = network_to_host_u64(wire);
     return true;
 }
 
-inline bool recv_message(int sock, NetMessage& msg) {
-    uint8_t type;
-    if (!recv_all(sock, &type, 1)) return false;
-    msg.type = (MsgType)type;
-    if (!recv_all(sock, &msg.term, 8)) return false;
-    if (!recv_all(sock, &msg.seq, 8)) return false;
-    if (!recv_all(sock, &msg.incarnation, 8)) return false;
-
-    uint32_t ksz, vsz;
-    if (!recv_all(sock, &ksz, 4)) return false;
-    if (!recv_all(sock, &vsz, 4)) return false;
-    msg.key.resize(ksz);
-    msg.value.resize(vsz);
-    if (!recv_all(sock, (void*)msg.key.data(), ksz)) return false;
-    if (!recv_all(sock, msg.value.data(), vsz)) return false;
-
-    // Receive tx_id for ALL transaction messages
-    if (msg.type == MsgType::TX_PREPARE || 
-        msg.type == MsgType::TX_COMMIT || 
-        msg.type == MsgType::TX_ABORT ||
-        msg.type == MsgType::CLIENT_TX_PUT) {
-        if (!recv_all(sock, &msg.tx_id, 8)) return false;
-        
-        // Only TX_PREPARE and CLIENT_TX_PUT have kv_pairs
-        if (msg.type == MsgType::TX_PREPARE || msg.type == MsgType::CLIENT_TX_PUT) {
-            uint32_t kv_count;
-            if (!recv_all(sock, &kv_count, 4)) return false;
-            msg.kv_pairs.clear();
-            for (uint32_t i = 0; i < kv_count; i++) {
-                uint32_t ksize, vsize;
-                if (!recv_all(sock, &ksize, 4)) return false;
-                if (!recv_all(sock, &vsize, 4)) return false;
-                std::string key(ksize, '\0');
-                std::vector<uint8_t> value(vsize);
-                if (!recv_all(sock, (void*)key.data(), ksize)) return false;
-                if (!recv_all(sock, value.data(), vsize)) return false;
-                msg.kv_pairs.emplace_back(key, value);
-            }
-        }
+inline bool send_message(int sock, const NetMessage& msg) {
+    if (msg.key.size() > kMaxWireKeySize ||
+        msg.value.size() > kMaxWireValueSize) {
+        return false;
     }
-    return true;
+
+    const uint32_t magic = htonl(kProtocolMagic);
+    const uint16_t version = htons(kProtocolVersion);
+    const uint8_t type = static_cast<uint8_t>(msg.type);
+    const uint8_t status = static_cast<uint8_t>(msg.status);
+    const uint32_t key_size = htonl(static_cast<uint32_t>(msg.key.size()));
+    const uint32_t value_size = htonl(static_cast<uint32_t>(msg.value.size()));
+
+    return send_all(sock, &magic, sizeof(magic)) &&
+           send_all(sock, &version, sizeof(version)) &&
+           send_all(sock, &type, sizeof(type)) &&
+           send_all(sock, &status, sizeof(status)) &&
+           send_u64(sock, msg.term) &&
+           send_u64(sock, msg.seq) &&
+           send_u64(sock, msg.incarnation) &&
+           send_u64(sock, msg.worker_id) &&
+           send_u64(sock, msg.segment_index) &&
+           send_u64(sock, msg.object_index) &&
+           send_all(sock, &key_size, sizeof(key_size)) &&
+           send_all(sock, &value_size, sizeof(value_size)) &&
+           send_all(sock, msg.key.data(), msg.key.size()) &&
+           send_all(sock, msg.value.data(), msg.value.size());
+}
+
+inline bool recv_message(int sock, NetMessage& msg) {
+    uint32_t magic = 0;
+    uint16_t version = 0;
+    uint8_t type = 0;
+    uint8_t status = 0;
+    uint32_t key_size = 0;
+    uint32_t value_size = 0;
+
+    if (!recv_all(sock, &magic, sizeof(magic)) ||
+        !recv_all(sock, &version, sizeof(version)) ||
+        !recv_all(sock, &type, sizeof(type)) ||
+        !recv_all(sock, &status, sizeof(status))) {
+        return false;
+    }
+    if (ntohl(magic) != kProtocolMagic || ntohs(version) != kProtocolVersion ||
+        !valid_message_type(type) ||
+        status > static_cast<uint8_t>(OperationStatus::SHUTTING_DOWN)) {
+        return false;
+    }
+
+    msg = NetMessage{};
+    msg.type = static_cast<MsgType>(type);
+    msg.status = static_cast<OperationStatus>(status);
+    if (!recv_u64(sock, msg.term) ||
+        !recv_u64(sock, msg.seq) ||
+        !recv_u64(sock, msg.incarnation) ||
+        !recv_u64(sock, msg.worker_id) ||
+        !recv_u64(sock, msg.segment_index) ||
+        !recv_u64(sock, msg.object_index) ||
+        !recv_all(sock, &key_size, sizeof(key_size)) ||
+        !recv_all(sock, &value_size, sizeof(value_size))) {
+        return false;
+    }
+
+    key_size = ntohl(key_size);
+    value_size = ntohl(value_size);
+    if (key_size > kMaxWireKeySize || value_size > kMaxWireValueSize) {
+        return false;
+    }
+
+    msg.key.resize(key_size);
+    msg.value.resize(value_size);
+    return recv_all(sock, msg.key.data(), msg.key.size()) &&
+           recv_all(sock, msg.value.data(), msg.value.size());
 }

@@ -5,10 +5,12 @@
 #include "../concurrency/incarnation.hpp"
 #include "../replica/replica_state.hpp"
 #include "../engine/worker.hpp"
+#include <limits>
 
 struct ApplyRecord {
     size_t seg_idx;
     uint64_t obj_idx;
+    uint64_t worker_id;
 };
 
 struct PutPath {
@@ -35,7 +37,7 @@ struct PutPath {
             if (new_seg < 0)
                 return false;
 
-            seg_idx = new_seg;
+            seg_idx = static_cast<uint64_t>(new_seg);
 
             w.active_segment.store(seg_idx, std::memory_order_release);
         }
@@ -51,7 +53,7 @@ struct PutPath {
 
         auto idx = seg.append(obj);
 
-        if (idx == UINT64_MAX) {
+        if (idx == std::numeric_limits<uint64_t>::max()) {
 
             seg.seal();
             auto new_seg = store.acquire_free_segment(w.worker_id, term);
@@ -65,11 +67,11 @@ struct PutPath {
 
             idx = next.append(obj);
 
-            if (idx == UINT64_MAX)
+            if (idx == std::numeric_limits<uint64_t>::max())
                 return false;
 
             out_apply = {
-                (size_t)new_seg, idx
+                static_cast<size_t>(new_seg), idx, w.worker_id
             };
             return true;
         }
@@ -78,17 +80,19 @@ struct PutPath {
             seg.seal();
 
         out_apply = {
-            seg_idx,
-            idx
+            static_cast<size_t>(seg_idx),
+            idx,
+            w.worker_id
         };
 
         return true;
     }
 
-    // engine/put_path.hpp
-    static bool put_replicated(
-        ReplicaState& rs,
+    static bool put_replicated_at(
         SegmentStore& store,
+        uint64_t worker_id,
+        size_t seg_idx,
+        uint64_t obj_idx,
         const std::string& key,
         const std::vector<uint8_t>& value,
         uint64_t term,
@@ -96,25 +100,26 @@ struct PutPath {
         uint64_t incarnation,  // ← Use this directly
         ApplyRecord& ar) {
 
-        size_t h = std::hash<std::string>{}(key);
-        size_t seg_idx = h % store.segments.size();
+        if (seg_idx >= store.segments.size()) return false;
         Segment& seg = *store.segments[seg_idx];
 
-        if (seg.meta.status.load(std::memory_order_acquire) != (uint8_t)SegmentStatus::ACTIVE) {
-            if (!store.try_acquire(seg, rs.replica_id, term))
+        if (seg.meta.status.load(std::memory_order_acquire) !=
+            static_cast<uint8_t>(SegmentStatus::ACTIVE)) {
+            if (!store.try_acquire(seg, worker_id, term))
                 return false;
+        } else if (seg.meta.owner_id.load(std::memory_order_acquire) != worker_id ||
+                   seg.meta.term_id.load(std::memory_order_acquire) != term) {
+            return false;
         }
 
-        // Create object using LEADER'S metadata (no local incarnation!)
         ObjectEntry obj(term, seq, incarnation, key, value);
-
-        uint64_t idx = seg.append(obj);
-        if (idx == UINT64_MAX) return false;
+        if (!seg.append_at(obj_idx, obj)) return false;
 
         if (seg.is_full()) seg.seal();
 
         ar.seg_idx = seg_idx;
-        ar.obj_idx = idx;
+        ar.obj_idx = obj_idx;
+        ar.worker_id = worker_id;
         return true;
     }
 };

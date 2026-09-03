@@ -1,4 +1,5 @@
 #include <iostream>
+#include <csignal>
 #include <sstream>
 #include <vector>
 #include "network/socket_utils.hpp"
@@ -20,13 +21,12 @@ std::vector<uint8_t> parse_value(const std::string& val_str) {
 }
 
 int main(int argc, char** argv) {
+    std::signal(SIGPIPE, SIG_IGN);
     if (argc < 4) {
         std::cout << "Usage:\n";
         std::cout << " PUT: ./cl put <port> <key> <value_csv>\n";
-        std::cout << " TXPUT: ./cl txput <port> <key1:value1,key2:value2,...>\n";
         std::cout << " GET: ./cl get <port> <key>\n";
         std::cout << "Example: ./cl put 5000 mykey 1,2,3\n";
-        std::cout << "Example: ./cl txput 5000 \"A:90,B:110\"\n";
         return 1;
     }
 
@@ -68,51 +68,13 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+        if (reply.type != MsgType::CLIENT_PUT_REPLY ||
+            reply.status != OperationStatus::OK) {
+            std::cerr << "PUT failed: " << status_name(reply.status) << "\n";
+            close(sock);
+            return 2;
+        }
         std::cout << "PUT completed successfully\n";
-
-    } else if (op == "txput") {
-        if (argc < 4) {
-            std::cerr << "Error: TXPUT requires key-value pairs\n";
-            close(sock);
-            return 1;
-        }
-        std::string pairs_str = argv[3];
-        std::vector<TxKeyValue> kv_pairs;
-        
-        std::stringstream ss(pairs_str);
-        std::string pair;
-        while (std::getline(ss, pair, ',')) {
-            size_t colon = pair.find(':');
-            if (colon != std::string::npos) {
-                std::string key = pair.substr(0, colon);
-                std::string val_str = pair.substr(colon + 1);
-                kv_pairs.emplace_back(key, parse_value(val_str));
-            }
-        }
-
-        if (kv_pairs.empty()) {
-            std::cerr << "Error: No valid key-value pairs found\n";
-            close(sock);
-            return 1;
-        }
-
-        msg.type = MsgType::CLIENT_TX_PUT;
-        msg.kv_pairs = kv_pairs;
-
-        if (!send_message(sock, msg)) {
-            std::cerr << "Failed to send TXPUT request\n";
-            close(sock);
-            return 1;
-        }
-
-        NetMessage reply;
-        if (!recv_message(sock, reply)) {
-            std::cerr << "Failed to receive TXPUT reply\n";
-            close(sock);
-            return 1;
-        }
-
-        std::cout << "Multi-key transaction completed successfully\n";
 
     } else if (op == "get") {
         std::string key = argv[3];
@@ -130,6 +92,13 @@ int main(int argc, char** argv) {
             std::cerr << "Failed to receive GET reply\n";
             close(sock);
             return 1;
+        }
+
+        if (reply.type != MsgType::CLIENT_GET_REPLY ||
+            reply.status != OperationStatus::OK) {
+            std::cerr << "GET failed: " << status_name(reply.status) << "\n";
+            close(sock);
+            return reply.status == OperationStatus::NOT_FOUND ? 3 : 2;
         }
 
         std::cout << "GET reply:\n";
