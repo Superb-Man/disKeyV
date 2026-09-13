@@ -1,13 +1,14 @@
 #pragma once
 #include "segment.hpp"
+#include "../logging/log.hpp"
 #include <vector>
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
 
 struct SegmentStore {
-    std::vector<Segment*> segments;
-    std::atomic<uint64_t> global_seg_ver{0};
+    std::vector<Segment*> segments;          // Fixed physical segment arena.
+    std::atomic<uint64_t> global_seg_ver{0}; // Monotonic allocation generation.
 
     SegmentStore(size_t nseg, uint64_t cap) {
         for (size_t i = 0; i < nseg; i++) {
@@ -50,9 +51,17 @@ struct SegmentStore {
 
         seg.meta.tail_idx.store(0, std::memory_order_release);
 
+        DISKEYV_DEBUG("SEGMENT",
+                      "segment=" << seg.seg_index << " state=active worker="
+                                 << wid << " term=" << term << " version="
+                                 << seg.meta.seg_ver.load(
+                                        std::memory_order_acquire));
+
         return true;
     }
 
+    // Claim any FREE segment for one worker/term. The status CAS is the
+    // ownership arbitration point when multiple workers allocate concurrently.
     int64_t acquire_free_segment(uint64_t wid, uint64_t term) {
 
         for (size_t i = 0; i < segments.size(); i++) {
@@ -73,9 +82,20 @@ struct SegmentStore {
             seg.meta.seg_ver.store(global_seg_ver.fetch_add(1) + 1, std::memory_order_release);
             seg.meta.tail_idx.store(0, std::memory_order_release);
 
+            DISKEYV_DEBUG("SEGMENT",
+                          "segment=" << i << " state=active worker=" << wid
+                                     << " term=" << term << " version="
+                                     << seg.meta.seg_ver.load(
+                                            std::memory_order_acquire));
+
             return static_cast<int64_t>(i);
         }
 
+        DISKEYV_WARN("SEGMENT",
+                     "state=allocation-failed worker=" << wid
+                                                        << " term=" << term
+                                                        << " segments="
+                                                        << segments.size());
         return -1;
     }
 };

@@ -1,0 +1,3 @@
+services:
+  leader:
+    command: ["recover", "5000", "follower1:5000", "follower2:5000"]

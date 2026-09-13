@@ -1,111 +1,174 @@
 #pragma once
-#include <unordered_map>
-#include <string>
-#include "../storage/segment_store.hpp"
-#include <shared_mutex>
+
 #include <atomic>
-#include <mutex>
+#include <cstdint>
+#include <cstring>
+#include <functional>
+#include <limits>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#include "../storage/segment_store.hpp"
 
 using OffsetType = uint64_t;
 
+enum class IndexApplyResult {
+    APPLIED,
+    SUPERSEDED,
+    FULL,
+    INVALID
+};
+
+inline bool index_apply_succeeded(IndexApplyResult result) {
+    return result == IndexApplyResult::APPLIED ||
+           result == IndexApplyResult::SUPERSEDED;
+}
+
 class HashTable {
-    std::unordered_map<std::string, OffsetType> map;
-    mutable std::shared_mutex ht_mutex;
-
 public:
-    HashTable(size_t) {}
+    explicit HashTable(size_t capacity) : slots_(capacity) {
+        if (capacity == 0) {
+            throw std::invalid_argument("hash-table capacity must be nonzero");
+        }
+        for (auto& slot : slots_) slot.store(kEmpty, std::memory_order_relaxed);
+    }
 
-    void apply(SegmentStore& store, size_t seg_idx, uint64_t obj_idx) {
+    HashTable(const HashTable&) = delete;
+    HashTable& operator=(const HashTable&) = delete;
 
-        std::unique_lock<std::shared_mutex> lock(ht_mutex);
+    // Publish an immutable segment entry into the key index. Concurrent
+    // publishers race only on atomic offset slots; objects are never copied
+    // into the table itself.
+    IndexApplyResult apply(SegmentStore& store, size_t segment_index,
+                           uint64_t object_index) {
+        OffsetType new_offset = kEmpty;
+        if (!pack_offset(segment_index, object_index, new_offset)) {
+            return IndexApplyResult::INVALID;
+        }
 
-        if (seg_idx >= store.segments.size())
-            return;
+        ObjectEntry* incoming = resolve(store, new_offset);
+        if (incoming == nullptr || !valid_key(*incoming)) {
+            return IndexApplyResult::INVALID;
+        }
+        const std::string key(incoming->key);
+        const size_t first_slot = std::hash<std::string>{}(key) % slots_.size();
 
-        Segment* seg = store.segments[seg_idx];
+        for (size_t probe = 0; probe < slots_.size(); ++probe) {
+            std::atomic<OffsetType>& slot = slots_[(first_slot + probe) % slots_.size()];
 
-        if (obj_idx >= seg->capacity)
-            return;
+            while (true) {
+                OffsetType current = slot.load(std::memory_order_acquire);
+                if (current == kEmpty) {
+                    OffsetType expected = kEmpty;
+                    // Winning this CAS establishes the first index location
+                    // for the key; a loser reloads and re-evaluates the slot.
+                    if (slot.compare_exchange_weak(
+                            expected, new_offset, std::memory_order_release,
+                            std::memory_order_acquire)) {
+                        return IndexApplyResult::APPLIED;
+                    }
+                    continue;
+                }
 
-        std::atomic_thread_fence(std::memory_order_acquire);
+                ObjectEntry* existing = resolve(store, current);
+                if (existing == nullptr || !valid_key(*existing)) {
+                    return IndexApplyResult::INVALID;
+                }
+                if (!key_equals(*existing, key)) break;
 
-        ObjectEntry& obj = seg->entries[obj_idx];
-
-        char safe_key[65];
-
-        std::memcpy(safe_key, obj.key, 64);
-
-        safe_key[64] = '\0';
-
-        bool valid = false;
-
-        for (int i = 0; i < 64; i++) {
-
-            if (safe_key[i] != 0) {
-                valid = true;
-                break;
+                // An older immutable version remains in SegmentStore but must
+                // not replace the offset of a newer visible version.
+                if (!newer_than(*incoming, *existing)) {
+                    return IndexApplyResult::SUPERSEDED;
+                }
+                if (slot.compare_exchange_weak(
+                        current, new_offset, std::memory_order_acq_rel,
+                        std::memory_order_acquire)) {
+                    return IndexApplyResult::APPLIED;
+                }
             }
         }
-
-        if (!valid)
-            return;
-
-        auto it = map.find(obj.key);
-
-        if (it == map.end()) {
-
-            map[obj.key] = ((uint64_t)seg_idx << 32) | obj_idx;
-
-            return;
-        }
-
-        auto packed = it->second;
-
-        auto old_seg = packed >> 32;
-
-        auto old_idx = packed & 0xffffffffULL;
-
-        ObjectEntry* old = &store.segments[old_seg]->entries[old_idx];
-
-        if (std::tie(obj.term_id, obj.incarnation)>std::tie(old->term_id, old->incarnation)) {
-
-            map[obj.key] =((uint64_t)seg_idx << 32) | obj_idx;
-        }
+        return IndexApplyResult::FULL;
     }
-    
-    /**
-     * Get the ObjectEntry pointer for a given key.
-     * @param store The SegmentStore containing segments.
-     * @param k The key to look up.
-     * @return Pointer to the ObjectEntry if found, nullptr otherwise.
-     */
-    ObjectEntry* get(SegmentStore& store, const std::string& key) {
-        std::shared_lock<std::shared_mutex>lock(ht_mutex);
 
-        auto it = map.find(key);
+    // Follow the same linear-probing chain used by apply. An empty slot ends
+    // the search because entries are never deleted from the current index.
+    ObjectEntry* get(SegmentStore& store, const std::string& key) const {
+        const size_t first_slot = std::hash<std::string>{}(key) % slots_.size();
+        for (size_t probe = 0; probe < slots_.size(); ++probe) {
+            const OffsetType current =
+                slots_[(first_slot + probe) % slots_.size()].load(
+                    std::memory_order_acquire);
+            if (current == kEmpty) return nullptr;
 
-        if (it == map.end())
+            ObjectEntry* entry = resolve(store, current);
+            if (entry == nullptr || !valid_key(*entry)) return nullptr;
+            if (key_equals(*entry, key)) return entry;
+        }
+        return nullptr;
+    }
+
+    size_t capacity() const { return slots_.size(); }
+
+private:
+    static constexpr OffsetType kEmpty = 0; // Reserved "no object" sentinel.
+    static constexpr uint64_t kLowMask = 0xffffffffULL;
+    // Each slot packs segment index in the high half and object index low.
+    std::vector<std::atomic<OffsetType>> slots_;
+
+    // Segment indices are biased by one so packed offset zero stays available
+    // as the empty sentinel while physical segment zero remains representable.
+    static bool pack_offset(size_t segment_index, uint64_t object_index,
+                            OffsetType& packed) {
+        if (segment_index >= std::numeric_limits<uint32_t>::max() ||
+            object_index > std::numeric_limits<uint32_t>::max()) {
+            return false;
+        }
+        const uint64_t biased_segment = static_cast<uint64_t>(segment_index) + 1;
+        packed = (biased_segment << 32U) | object_index;
+        return true;
+    }
+
+    static bool unpack_offset(OffsetType packed, size_t& segment_index,
+                              uint64_t& object_index) {
+        const uint64_t biased_segment = packed >> 32U;
+        if (biased_segment == 0) return false;
+        segment_index = static_cast<size_t>(biased_segment - 1);
+        object_index = packed & kLowMask;
+        return true;
+    }
+
+    static ObjectEntry* resolve(SegmentStore& store, OffsetType packed) {
+        size_t segment_index = 0;
+        uint64_t object_index = 0;
+        if (!unpack_offset(packed, segment_index, object_index) ||
+            segment_index >= store.segments.size()) {
             return nullptr;
-
-        auto packed = it->second;
-
-        auto seg_idx = packed >> 32;
-
-        auto obj_idx = packed & 0xffffffffULL;
-
-        if (seg_idx >= store.segments.size())
+        }
+        Segment* segment = store.segments[segment_index];
+        if (object_index >= segment->capacity ||
+            object_index >= segment->meta.tail_idx.load(std::memory_order_acquire)) {
             return nullptr;
+        }
+        return &segment->entries[object_index];
+    }
 
-        if (obj_idx >= store.segments[seg_idx]->capacity)
-            return nullptr;
+    static bool valid_key(const ObjectEntry& entry) {
+        return entry.key[0] != '\0' &&
+               std::memchr(entry.key, '\0', sizeof(entry.key)) != nullptr;
+    }
 
-        std::atomic_thread_fence(std::memory_order_acquire);
+    static bool key_equals(const ObjectEntry& entry, const std::string& key) {
+        const size_t stored_length = strnlen(entry.key, sizeof(entry.key));
+        return stored_length == key.size() &&
+               std::memcmp(entry.key, key.data(), stored_length) == 0;
+    }
 
-        auto& obj = store.segments[seg_idx]->entries[obj_idx];
-
-        if (std::string(obj.key, key.size()) != key)
-            return nullptr;
-
-        return &obj;
+    static bool newer_than(const ObjectEntry& incoming,
+                           const ObjectEntry& existing) {
+        return incoming.term_id > existing.term_id ||
+               (incoming.term_id == existing.term_id &&
+                incoming.incarnation > existing.incarnation);
     }
 };

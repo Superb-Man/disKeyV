@@ -1,0 +1,81 @@
+x-replica: &replica
+  build:
+    context: .
+    target: runtime
+  image: diskeyv:local
+  init: true
+  read_only: true
+  tmpfs:
+    - /tmp:size=16m
+  security_opt:
+    - no-new-privileges:true
+  healthcheck:
+    test: ["CMD", "/usr/local/bin/diskeyv-client", "health", "5000"]
+    interval: 2s
+    timeout: 2s
+    retries: 10
+    start_period: 2s
+  stop_grace_period: 10s
+  networks:
+    - diskeyv
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "3"
+
+services:
+  follower1:
+    <<: *replica
+    command: ["follower", "5000"]
+    environment:
+      DISKEYV_REPLICA_ID: "2"
+      DISKEYV_LOG_LEVEL: "${DISKEYV_LOG_LEVEL:-INFO}"
+    ports:
+      - "127.0.0.1:${DISKEYV_FOLLOWER1_PORT:-5001}:5000"
+    cpus: 1.0
+    mem_limit: 256m
+
+  follower2:
+    <<: *replica
+    command: ["follower", "5000"]
+    environment:
+      DISKEYV_REPLICA_ID: "3"
+      DISKEYV_LOG_LEVEL: "${DISKEYV_LOG_LEVEL:-INFO}"
+    ports:
+      - "127.0.0.1:${DISKEYV_FOLLOWER2_PORT:-5002}:5000"
+    cpus: 1.0
+    mem_limit: 256m
+
+  leader:
+    <<: *replica
+    command: ["leader", "5000", "follower1:5000", "follower2:5000"]
+    environment:
+      DISKEYV_REPLICA_ID: "1"
+      DISKEYV_WORKERS: "${DISKEYV_LEADER_WORKERS:-4}"
+      DISKEYV_LOG_LEVEL: "${DISKEYV_LOG_LEVEL:-INFO}"
+    depends_on:
+      follower1:
+        condition: service_healthy
+      follower2:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${DISKEYV_LEADER_PORT:-5000}:5000"
+    cpus: 2.0
+    mem_limit: 512m
+
+  client:
+    image: diskeyv:local
+    profiles: ["tools"]
+    entrypoint: ["/usr/local/bin/diskeyv-client"]
+    environment:
+      DISKEYV_HOST: leader
+    depends_on:
+      leader:
+        condition: service_healthy
+    networks:
+      - diskeyv
+
+networks:
+  diskeyv:
+    driver: bridge

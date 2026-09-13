@@ -1,0 +1,11 @@
+.git
+.github
+.vscode
+build*
+*.o
+*.out
+tests/*.log
+docs
+tests
+README.md
+LoLKV_Codebase_Analysis_and_Project_Plan.md

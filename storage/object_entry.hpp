@@ -7,12 +7,12 @@
 struct ObjectEntry {
     static constexpr size_t kMaxKeySize = 63;
 
-    uint64_t term_id;
-    uint64_t seq_num;
-    uint64_t incarnation;
+    uint64_t term_id;       // Leader epoch that created this immutable entry.
+    uint64_t seq_num;       // Contiguous sequence in its worker's stream.
+    uint64_t incarnation;   // Per-key version used to choose the newest value.
 
-    char key[64];
-    std::vector<uint8_t> value;
+    char key[64];                   // NUL-terminated; at most 63 key bytes.
+    std::vector<uint8_t> value;     // Value owned by this segment entry.
 
         ObjectEntry() : term_id(0), seq_num(0), incarnation(0) {
         std::memset(key, 0, sizeof(key));

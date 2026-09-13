@@ -8,12 +8,14 @@
 #include <limits>
 
 struct ApplyRecord {
-    size_t seg_idx;
-    uint64_t obj_idx;
-    uint64_t worker_id;
+    size_t seg_idx;       // Physical segment containing the appended object.
+    uint64_t obj_idx;     // Object position inside that segment.
+    uint64_t worker_id;   // Logical stream that owns the object.
 };
 
 struct PutPath {
+    // Append a leader-generated immutable object. Publication to the hash
+    // index happens later, after replication reaches the required quorum.
     static bool put(
         Worker& w,
         ReplicaState& rs,
@@ -23,12 +25,21 @@ struct PutPath {
         const std::vector<uint8_t>& value,
         ApplyRecord& out_apply) {
 
-        auto seq = w.sequence_number.fetch_add(1) + 1;
-
-        auto incarnation = inc.next(key);
         auto term = rs.current_term.load(std::memory_order_acquire);
-
         auto seg_idx = w.active_segment.load(std::memory_order_acquire);
+
+        if (seg_idx != UINT64_MAX) {
+            Segment& active = *store.segments[seg_idx];
+            // A worker never appends through a stale or exhausted segment
+            // handle; sealing makes the transition explicit for recovery.
+            if (active.meta.status.load(std::memory_order_acquire) !=
+                    static_cast<uint8_t>(SegmentStatus::ACTIVE) ||
+                active.is_full()) {
+                active.seal();
+                seg_idx = UINT64_MAX;
+                w.active_segment.store(UINT64_MAX, std::memory_order_release);
+            }
+        }
 
         if (seg_idx == UINT64_MAX) {
 
@@ -42,6 +53,10 @@ struct PutPath {
             w.active_segment.store(seg_idx, std::memory_order_release);
         }
 
+        // Sequence orders this worker's replication stream; incarnation
+        // orders competing versions of the same key across worker streams.
+        const auto seq = w.sequence_number.fetch_add(1) + 1;
+        const auto incarnation = inc.next(key);
         Segment& seg = *store.segments[seg_idx];
 
         ObjectEntry obj(
@@ -53,28 +68,7 @@ struct PutPath {
 
         auto idx = seg.append(obj);
 
-        if (idx == std::numeric_limits<uint64_t>::max()) {
-
-            seg.seal();
-            auto new_seg = store.acquire_free_segment(w.worker_id, term);
-
-            if (new_seg < 0)
-                return false;
-
-            w.active_segment.store(new_seg, std::memory_order_release);
-
-            Segment& next = *store.segments[new_seg];
-
-            idx = next.append(obj);
-
-            if (idx == std::numeric_limits<uint64_t>::max())
-                return false;
-
-            out_apply = {
-                static_cast<size_t>(new_seg), idx, w.worker_id
-            };
-            return true;
-        }
+        if (idx == std::numeric_limits<uint64_t>::max()) return false;
 
         if (seg.is_full())
             seg.seal();
@@ -88,6 +82,8 @@ struct PutPath {
         return true;
     }
 
+    // Reproduce the leader's exact physical offset on a follower or during
+    // recovery. append_at enforces that the stream fills offsets contiguously.
     static bool put_replicated_at(
         SegmentStore& store,
         uint64_t worker_id,
@@ -97,17 +93,24 @@ struct PutPath {
         const std::vector<uint8_t>& value,
         uint64_t term,
         uint64_t seq,
-        uint64_t incarnation,  // ← Use this directly
-        ApplyRecord& ar) {
+        uint64_t incarnation,
+        ApplyRecord& ar,
+        bool allow_sealed_recovery = false) {
 
         if (seg_idx >= store.segments.size()) return false;
         Segment& seg = *store.segments[seg_idx];
 
-        if (seg.meta.status.load(std::memory_order_acquire) !=
-            static_cast<uint8_t>(SegmentStatus::ACTIVE)) {
+        const uint8_t status = seg.meta.status.load(std::memory_order_acquire);
+        if (status == static_cast<uint8_t>(SegmentStatus::FREE)) {
+            // First record at this offset claims the segment for its original
+            // worker and term; later records must match that ownership.
             if (!store.try_acquire(seg, worker_id, term))
                 return false;
-        } else if (seg.meta.owner_id.load(std::memory_order_acquire) != worker_id ||
+        } else if ((status != static_cast<uint8_t>(SegmentStatus::ACTIVE) &&
+                    !(allow_sealed_recovery &&
+                      status == static_cast<uint8_t>(SegmentStatus::SEALED))) ||
+                   seg.meta.owner_id.load(std::memory_order_acquire) !=
+                       worker_id ||
                    seg.meta.term_id.load(std::memory_order_acquire) != term) {
             return false;
         }
