@@ -1,3 +1,17 @@
 services:
   leader:
-    command: ["recover", "5000", "follower1:5000", "follower2:5000"]
+    command: ["recover", "5000", "follower1:5000", "follower2:5000", "follower3:5000", "follower4:5000"]
+    environment:
+      DISKEYV_ELECTION_ENABLED: "0"
+  follower1:
+    environment:
+      DISKEYV_ELECTION_ENABLED: "0"
+  follower2:
+    environment:
+      DISKEYV_ELECTION_ENABLED: "0"
+  follower3:
+    environment:
+      DISKEYV_ELECTION_ENABLED: "0"
+  follower4:
+    environment:
+      DISKEYV_ELECTION_ENABLED: "0"

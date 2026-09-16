@@ -11,10 +11,12 @@ x-replica: &replica
     - no-new-privileges:true
   healthcheck:
     test: ["CMD", "/usr/local/bin/diskeyv-client", "health", "5000"]
-    interval: 2s
-    timeout: 2s
-    retries: 10
-    start_period: 2s
+    # Followers must be listening before the preferred node's immediate vote
+    # request, but the dependency should resolve before follower timeouts fire.
+    interval: 250ms
+    timeout: 1s
+    retries: 20
+    start_period: 250ms
   stop_grace_period: 10s
   networks:
     - diskeyv
@@ -27,9 +29,12 @@ x-replica: &replica
 services:
   follower1:
     <<: *replica
-    command: ["follower", "5000"]
+    command:
+      ["follower", "5000", "leader:5000", "follower2:5000", "follower3:5000", "follower4:5000"]
     environment:
       DISKEYV_REPLICA_ID: "2"
+      DISKEYV_WORKERS: "${DISKEYV_LEADER_WORKERS:-4}"
+      DISKEYV_ELECTION_ENABLED: "${DISKEYV_ELECTION_ENABLED:-1}"
       DISKEYV_LOG_LEVEL: "${DISKEYV_LOG_LEVEL:-INFO}"
     ports:
       - "127.0.0.1:${DISKEYV_FOLLOWER1_PORT:-5001}:5000"
@@ -38,26 +43,62 @@ services:
 
   follower2:
     <<: *replica
-    command: ["follower", "5000"]
+    command:
+      ["follower", "5000", "leader:5000", "follower1:5000", "follower3:5000", "follower4:5000"]
     environment:
       DISKEYV_REPLICA_ID: "3"
+      DISKEYV_WORKERS: "${DISKEYV_LEADER_WORKERS:-4}"
+      DISKEYV_ELECTION_ENABLED: "${DISKEYV_ELECTION_ENABLED:-1}"
       DISKEYV_LOG_LEVEL: "${DISKEYV_LOG_LEVEL:-INFO}"
     ports:
       - "127.0.0.1:${DISKEYV_FOLLOWER2_PORT:-5002}:5000"
     cpus: 1.0
     mem_limit: 256m
 
+  follower3:
+    <<: *replica
+    command:
+      ["follower", "5000", "leader:5000", "follower1:5000", "follower2:5000", "follower4:5000"]
+    environment:
+      DISKEYV_REPLICA_ID: "4"
+      DISKEYV_WORKERS: "${DISKEYV_LEADER_WORKERS:-4}"
+      DISKEYV_ELECTION_ENABLED: "${DISKEYV_ELECTION_ENABLED:-1}"
+      DISKEYV_LOG_LEVEL: "${DISKEYV_LOG_LEVEL:-INFO}"
+    ports:
+      - "127.0.0.1:${DISKEYV_FOLLOWER3_PORT:-5003}:5000"
+    cpus: 1.0
+    mem_limit: 256m
+
+  follower4:
+    <<: *replica
+    command:
+      ["follower", "5000", "leader:5000", "follower1:5000", "follower2:5000", "follower3:5000"]
+    environment:
+      DISKEYV_REPLICA_ID: "5"
+      DISKEYV_WORKERS: "${DISKEYV_LEADER_WORKERS:-4}"
+      DISKEYV_ELECTION_ENABLED: "${DISKEYV_ELECTION_ENABLED:-1}"
+      DISKEYV_LOG_LEVEL: "${DISKEYV_LOG_LEVEL:-INFO}"
+    ports:
+      - "127.0.0.1:${DISKEYV_FOLLOWER4_PORT:-5004}:5000"
+    cpus: 1.0
+    mem_limit: 256m
+
   leader:
     <<: *replica
-    command: ["leader", "5000", "follower1:5000", "follower2:5000"]
+    command: ["leader", "5000", "follower1:5000", "follower2:5000", "follower3:5000", "follower4:5000"]
     environment:
       DISKEYV_REPLICA_ID: "1"
       DISKEYV_WORKERS: "${DISKEYV_LEADER_WORKERS:-4}"
+      DISKEYV_ELECTION_ENABLED: "${DISKEYV_ELECTION_ENABLED:-1}"
       DISKEYV_LOG_LEVEL: "${DISKEYV_LOG_LEVEL:-INFO}"
     depends_on:
       follower1:
         condition: service_healthy
       follower2:
+        condition: service_healthy
+      follower3:
+        condition: service_healthy
+      follower4:
         condition: service_healthy
     ports:
       - "127.0.0.1:${DISKEYV_LEADER_PORT:-5000}:5000"

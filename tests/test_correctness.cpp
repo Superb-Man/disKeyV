@@ -1,8 +1,11 @@
 #include <atomic>
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdlib>
 #include <cerrno>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <iostream>
 #include <string>
@@ -86,6 +89,16 @@ int bound_tcp_port(int socket) {
     return static_cast<int>(ntohs(address.sin_port));
 }
 
+bool wait_until(const std::function<bool()>& condition,
+                std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (condition()) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return condition();
+}
+
 void test_replication_session_pipelines_batches() {
     const int server = create_server(0);
     check(server >= 0, "pipeline peer listener");
@@ -146,7 +159,7 @@ void test_replication_session_pipelines_batches() {
 
     ReplicationSession session(PeerEndpoint("127.0.0.1", port));
     const bool replicated = session.replicate_to(
-        1, 0, history.size(),
+        1, 1, 0, history.size(),
         [&](size_t first, size_t last) {
             NetMessage batch;
             batch.type = MsgType::PUT_REPL_BATCH;
@@ -154,10 +167,8 @@ void test_replication_session_pipelines_batches() {
             batch.worker_id = 0;
             batch.seq = history[first].sequence;
             const size_t end = std::min(last, first + kMaxWireBatchEntries);
-            batch.entries.assign(history.begin() +
-                                     static_cast<std::ptrdiff_t>(first),
-                                 history.begin() +
-                                     static_cast<std::ptrdiff_t>(end));
+            batch.entries.assign(history.begin() + static_cast<std::ptrdiff_t>(first),
+                                 history.begin() + static_cast<std::ptrdiff_t>(end));
             return batch;
         });
     peer.join();
@@ -165,6 +176,120 @@ void test_replication_session_pipelines_batches() {
     check(replicated && session.highest_acked == history.size() &&
               received_window.load(std::memory_order_acquire),
           "replication session sends a bounded multi-batch window before ACKs");
+}
+
+void test_majority_election_and_automatic_failover() {
+    constexpr size_t kReplicaCount = 5;
+    std::array<int, kReplicaCount> ports{};
+    for (size_t index = 0; index < ports.size(); ++index) {
+        do {
+            ports[index] = unused_tcp_port();
+        } while (std::find(ports.begin(), ports.begin() + index,
+                           ports[index]) != ports.begin() + index);
+    }
+
+    auto peers_for = [&ports](size_t self) {
+        std::vector<PeerEndpoint> peers;
+        for (size_t index = 0; index < ports.size(); ++index) {
+            if (index != self) {
+                peers.emplace_back("127.0.0.1", ports[index]);
+            }
+        }
+        return peers;
+    };
+
+    std::array<std::unique_ptr<Replica>, kReplicaCount> replicas;
+    // Two bootstrap preferences deliberately model a bad static deployment.
+    // Majority voting must still produce no more than one active leader.
+    for (size_t index = 0; index < replicas.size(); ++index) {
+        replicas[index] = std::make_unique<Replica>(
+            index + 1, 1, index < 2 ? Role::LEADER : Role::FOLLOWER,
+            ports[index], peers_for(index), 16, 32, 128, false, true);
+    }
+
+    auto leader_count = [&replicas] {
+        size_t count = 0;
+        for (const auto& replica : replicas) {
+            if (replica && replica->rs.role.load(std::memory_order_acquire) ==
+                               Role::LEADER) {
+                ++count;
+            }
+        }
+        return count;
+    };
+    auto leader_index = [&replicas]() -> size_t {
+        for (size_t index = 0; index < replicas.size(); ++index) {
+            if (replicas[index] &&
+                replicas[index]->rs.role.load(std::memory_order_acquire) ==
+                    Role::LEADER) {
+                return index;
+            }
+        }
+        return replicas.size();
+    };
+    auto cluster_agrees_on_leader = [&replicas, &leader_count,
+                                     &leader_index] {
+        if (leader_count() != 1) return false;
+        const size_t elected = leader_index();
+        const uint64_t elected_id = replicas[elected]->rs.replica_id;
+        for (const auto& replica : replicas) {
+            if (replica &&
+                replica->rs.leader_id.load(std::memory_order_acquire) !=
+                    elected_id) {
+                return false;
+            }
+        }
+        return true;
+    };
+    auto all_live_replicas_have = [&replicas](const std::string& key) {
+        for (const auto& replica : replicas) {
+            if (replica && replica->get(key) == nullptr) return false;
+        }
+        return true;
+    };
+
+    check(wait_until(cluster_agrees_on_leader,
+                     std::chrono::milliseconds(5000)),
+          "a majority elects one leader despite two bootstrap preferences");
+    for (int sample = 0; sample < 50; ++sample) {
+        check(leader_count() <= 1,
+              "majority intersection prevents simultaneous leaders");
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+
+    const size_t failed_leader = leader_index();
+    check(failed_leader < replicas.size(), "elected leader is identifiable");
+    check(replicas[failed_leader]->submit_put("before-failover", {1}) ==
+              OperationStatus::OK,
+          "elected leader replicates before failure");
+    check(wait_until(
+              [&all_live_replicas_have] {
+                  return all_live_replicas_have("before-failover");
+              },
+              std::chrono::milliseconds(3000)),
+          "pre-failover write converges across all five replicas");
+    const uint64_t failed_term = replicas[failed_leader]->rs.current_term.load(
+        std::memory_order_acquire);
+    replicas[failed_leader]->shutdown();
+    replicas[failed_leader].reset();
+
+    check(wait_until(cluster_agrees_on_leader,
+                     std::chrono::milliseconds(5000)),
+          "surviving majority automatically promotes a replacement leader");
+    const size_t replacement = leader_index();
+    check(replacement < replicas.size() &&
+              replicas[replacement]->rs.current_term.load(
+                  std::memory_order_acquire) > failed_term,
+          "replacement leadership is fenced by a higher term");
+    check(replicas[replacement]->submit_put("after-failover", {2}) ==
+              OperationStatus::OK,
+          "replacement leader serves writes with a three-replica quorum");
+    check(wait_until(
+              [&all_live_replicas_have] {
+                  return all_live_replicas_have("after-failover");
+              },
+              std::chrono::milliseconds(3000)),
+          "post-failover write reaches all four surviving replicas");
 }
 
 void test_client_completes_at_early_quorum() {
@@ -669,6 +794,7 @@ int main() {
     test_endpoint_parsing();
     test_health_check();
     test_replication_session_pipelines_batches();
+    test_majority_election_and_automatic_failover();
     test_client_completes_at_early_quorum();
     test_no_false_success_without_quorum();
     test_success_requires_replication_and_publication();

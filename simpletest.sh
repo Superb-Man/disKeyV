@@ -1,14 +1,20 @@
 #!/bin/bash
 
-./a follower 5001 &
+DISKEYV_REPLICA_ID=2 ./a follower 5001 5000 5002 5003 5004 &
 F1=$!
 
-./a follower 5002 &
+DISKEYV_REPLICA_ID=3 ./a follower 5002 5000 5001 5003 5004 &
 F2=$!
+
+DISKEYV_REPLICA_ID=4 ./a follower 5003 5000 5001 5002 5004 &
+F3=$!
+
+DISKEYV_REPLICA_ID=5 ./a follower 5004 5000 5001 5002 5003 &
+F4=$!
 
 sleep 1
 
-./a leader 5000 5001 5002 &
+DISKEYV_REPLICA_ID=1 ./a leader 5000 5001 5002 5003 5004 &
 L=$!
 
 wait

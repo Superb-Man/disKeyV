@@ -29,7 +29,13 @@ enum class MsgType : uint8_t {
     RECOVERY_FETCH_REPLY = 15,
     RECOVERY_INSTALL_BATCH = 16,
     TERM_ADVANCE = 17,
-    TERM_ADVANCE_REPLY = 18
+    TERM_ADVANCE_REPLY = 18,
+    HEARTBEAT = 19,
+    HEARTBEAT_REPLY = 20,
+    VOTE_REQUEST = 21,
+    VOTE_REPLY = 22,
+    PRE_VOTE_REQUEST = 23,
+    PRE_VOTE_REPLY = 24
 };
 
 enum class OperationStatus : uint8_t {
@@ -90,6 +96,11 @@ struct NetMessage {
     uint64_t worker_id{0};
     uint64_t segment_index{0};
     uint64_t object_index{0};
+    // Election messages identify their sender explicitly and advertise the
+    // freshest committed segment-ownership tuple known by that replica.
+    uint64_t sender_id{0};
+    uint64_t last_segment_term{0};
+    uint64_t last_segment_version{0};
     std::string key;
     std::vector<uint8_t> value;
     std::vector<ReplicationEntry> entries;
@@ -97,7 +108,7 @@ struct NetMessage {
 };
 
 constexpr uint32_t kProtocolMagic = 0x444b5633U;
-constexpr uint16_t kProtocolVersion = 3;         // Reject incompatible peers.
+constexpr uint16_t kProtocolVersion = 5;         // Reject incompatible peers.
 constexpr uint32_t kMaxWireKeySize = 63;
 constexpr uint32_t kMaxWireValueSize = 1024U * 1024U;
 constexpr uint32_t kMaxWireBatchEntries = 16;
@@ -121,7 +132,7 @@ inline uint64_t network_to_host_u64(uint64_t value) {
 
 inline bool valid_message_type(uint8_t type) {
     return type >= static_cast<uint8_t>(MsgType::PUT_REPL) &&
-           type <= static_cast<uint8_t>(MsgType::TERM_ADVANCE_REPLY);
+           type <= static_cast<uint8_t>(MsgType::PRE_VOTE_REPLY);
 }
 
 namespace message_detail {
@@ -209,6 +220,18 @@ inline bool valid_shape(const NetMessage& message) {
         message.value.size() > kMaxWireValueSize) {
         return false;
     }
+    const bool election_message = message.type == MsgType::HEARTBEAT ||
+                                  message.type == MsgType::HEARTBEAT_REPLY ||
+                                  message.type == MsgType::VOTE_REQUEST ||
+                                  message.type == MsgType::VOTE_REPLY ||
+                                  message.type == MsgType::PRE_VOTE_REQUEST ||
+                                  message.type == MsgType::PRE_VOTE_REPLY;
+    if (election_message &&
+        (message.term == 0 || message.sender_id == 0 ||
+         !message.key.empty() || !message.value.empty() ||
+         !message.entries.empty() || !message.worker_progress.empty())) {
+        return false;
+    }
     const bool carries_recovery_entries =
         message.type == MsgType::RECOVERY_FETCH_REPLY ||
         message.type == MsgType::RECOVERY_INSTALL_BATCH;
@@ -275,6 +298,9 @@ inline bool encode_payload(const NetMessage& message,
     append_u64(payload, message.worker_id);
     append_u64(payload, message.segment_index);
     append_u64(payload, message.object_index);
+    append_u64(payload, message.sender_id);
+    append_u64(payload, message.last_segment_term);
+    append_u64(payload, message.last_segment_version);
     append_u32(payload, static_cast<uint32_t>(message.key.size()));
     append_u32(payload, static_cast<uint32_t>(message.value.size()));
     append_bytes(payload, message.key.data(), message.key.size());
@@ -318,6 +344,9 @@ inline bool decode_payload(const std::vector<uint8_t>& payload,
         !read_u64(payload, cursor, message.worker_id) ||
         !read_u64(payload, cursor, message.segment_index) ||
         !read_u64(payload, cursor, message.object_index) ||
+        !read_u64(payload, cursor, message.sender_id) ||
+        !read_u64(payload, cursor, message.last_segment_term) ||
+        !read_u64(payload, cursor, message.last_segment_version) ||
         !read_u32(payload, cursor, key_size) ||
         !read_u32(payload, cursor, value_size) ||
         key_size > kMaxWireKeySize || value_size > kMaxWireValueSize ||

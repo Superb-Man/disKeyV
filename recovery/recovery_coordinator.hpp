@@ -7,6 +7,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -25,9 +26,8 @@
 #include "../replica/replica_state.hpp"
 #include "../storage/segment_store.hpp"
 
-// Static-leader adaptation of LoLKV data consolidation.  Recovery selects a
-// source independently for each worker because different worker streams may
-// have reached different replica majorities.
+// Recovery selects a source independently for each worker because different
+// worker streams may have reached different replica majorities.
 class RecoveryCoordinator {
 public:
     RecoveryCoordinator(ReplicaState& replica_state, SegmentStore& segment_store,
@@ -38,23 +38,50 @@ public:
           store_(segment_store),
           index_(index),
           endpoints_(endpoints),
-          worker_count_(worker_count) {}
+          worker_count_(worker_count),
+          // Unreachable endpoints stay in the quorum denominator. The caller
+          // must supply the full membership; this does not validate CLI changes.
+          required_survivors_((endpoints.size() + 1) / 2 + 1) {}
 
     uint64_t recover() {
+        return recover_impl(0);
+    }
+
+    // The caller must have won this term, block client access, quiesce local
+    // appends, and exclude concurrent follower installation for this call.
+    // It must maintain election heartbeats and recheck leadership before
+    // enabling client access. This method does not elect or publish a leader.
+    uint64_t recover_elected(uint64_t election_term) {
+        if (election_term == 0) {
+            throw std::invalid_argument("elected recovery requires a term");
+        }
+        return recover_impl(election_term);
+    }
+
+private:
+    uint64_t recover_impl(uint64_t election_term) {
+        elected_term_ = election_term;
+        recovery_term_ = 0; // Initial summaries precede recovery authorization.
+        peers_.clear();
+        local_records_.clear();
+        local_progress_.clear();
+        check_elected_epoch();
+        if (elected_term_ != 0) snapshot_local_history();
         DISKEYV_INFO("RECOVERY",
                      "replica=" << replica_state_.replica_id
                                 << " phase=start followers="
                                 << endpoints_.size() << " workers="
                                 << worker_count_);
-        if (endpoints_.empty()) {
+        if (endpoints_.empty() && elected_term_ == 0) {
             throw std::runtime_error(
                 "recovery requires at least one surviving follower");
         }
 
-        // Snapshot follower terms, choose a strictly newer term, then fence
-        // every participant before comparing stable worker summaries.
+        // Startup recovery chooses a new term. An elected survivor must use
+        // exactly the term it won; incrementing it would invalidate its votes.
         connect_and_collect_summaries();
-        recovery_term_ = choose_new_term();
+        recovery_term_ = elected_term_ != 0 ? elected_term_ : choose_new_term();
+        check_elected_epoch();
         DISKEYV_INFO("RECOVERY",
                      "replica=" << replica_state_.replica_id
                                 << " phase=term-selected term="
@@ -72,14 +99,21 @@ public:
         for (uint64_t worker_id = 0; worker_id < worker_count_; ++worker_id) {
             const SelectedPrefix& prefix = selected[worker_id];
             if (prefix.sequence == 0) continue;
-            std::vector<ReplicationEntry> records = fetch_worker_history(*peers_[prefix.peer_index], worker_id,
-                                     prefix.term, prefix.sequence);
+            std::vector<ReplicationEntry> records;
+            if (prefix.peer_index == kLocalSource) {
+                for (const auto& entry : local_records_) {
+                    if (entry.worker_id == worker_id) records.push_back(entry);
+                }
+            } else {
+                records = fetch_worker_history(*peers_[prefix.peer_index],
+                                              worker_id, prefix.term,
+                                              prefix.sequence);
+            }
             DISKEYV_INFO("RECOVERY",
                          "replica=" << replica_state_.replica_id
                                     << " phase=fetched worker=" << worker_id
                                     << " source="
-                                    << peers_[prefix.peer_index]
-                                           ->endpoint.identity()
+                                    << source_name(prefix)
                                     << " prefix=<" << prefix.term << ','
                                     << prefix.sequence << "> records="
                                     << records.size());
@@ -90,6 +124,12 @@ public:
             );
         }
 
+        // Preserve earlier local terms too. A selected remote source can have
+        // a newer stream while this survivor still holds older useful records.
+        // Exact duplicates are collapsed; conflicting offsets fail closed.
+        canonical_records.insert(canonical_records.end(),
+                                 local_records_.begin(), local_records_.end());
+        check_elected_epoch();
         validate_and_import(canonical_records, selected);
         DISKEYV_INFO("RECOVERY",
                      "replica=" << replica_state_.replica_id
@@ -98,9 +138,13 @@ public:
         repair_followers(canonical_records);
         refresh_stable_summaries();
         verify_repaired_followers(selected);
+        check_elected_epoch();
         rebuild_index(canonical_records);
         seal_recovered_segments();
-        replica_state_.current_term.store(recovery_term_, std::memory_order_release);
+        if (elected_term_ == 0) {
+            replica_state_.current_term.store(recovery_term_, std::memory_order_release);
+        }
+        check_elected_epoch();
         DISKEYV_INFO("RECOVERY",
                      "replica=" << replica_state_.replica_id
                                 << " phase=complete term=" << recovery_term_
@@ -108,7 +152,6 @@ public:
         return recovery_term_;
     }
 
-private:
     struct PeerSession {
         explicit PeerSession(PeerEndpoint peer_endpoint)
             : endpoint(std::move(peer_endpoint)) {}
@@ -130,10 +173,12 @@ private:
         std::map<uint64_t, WorkerProgressWire> progress;
     };
 
+    static constexpr size_t kLocalSource = std::numeric_limits<size_t>::max();
+
     struct SelectedPrefix {
         uint64_t term{0};       // Freshest term selected for one worker.
         uint64_t sequence{0};   // Contiguous upper bound copied from source.
-        size_t peer_index{0};   // Source session in peers_.
+        size_t peer_index{kLocalSource}; // Local snapshot or session in peers_.
     };
 
     ReplicaState& replica_state_;
@@ -141,8 +186,77 @@ private:
     HashTable& index_;
     const std::vector<PeerEndpoint>& endpoints_;
     size_t worker_count_;
-    uint64_t recovery_term_{0}; // One greater than every observed term.
+    // Full majority for an empty replacement; an elected survivor contributes
+    // its own retained history, reducing the required remote count by one.
+    size_t required_survivors_;
+    uint64_t recovery_term_{0}; // Fencing term used for this consolidation.
+    uint64_t elected_term_{0};  // Zero selects explicit startup recovery.
     std::vector<std::unique_ptr<PeerSession>> peers_;
+    std::vector<ReplicationEntry> local_records_;
+    std::map<uint64_t, WorkerProgressWire> local_progress_;
+
+    void check_elected_epoch() const {
+        if (elected_term_ == 0) return;
+        std::lock_guard<std::mutex> lock(replica_state_.election_mutex);
+        if (replica_state_.current_term.load(std::memory_order_acquire) !=
+                elected_term_ ||
+            replica_state_.role.load(std::memory_order_acquire) == Role::FOLLOWER ||
+            replica_state_.voted_term != elected_term_ ||
+            replica_state_.voted_for != replica_state_.replica_id) {
+            throw std::runtime_error("leadership changed during recovery");
+        }
+    }
+
+    std::string source_name(const SelectedPrefix& prefix) const {
+        return prefix.peer_index == kLocalSource
+                   ? "local"
+                   : peers_[prefix.peer_index]->endpoint.identity();
+    }
+
+    // Scan the survivor while its caller holds the local recovery barrier.
+    // Segment ownership supplies the worker ID absent from ObjectEntry itself.
+    void snapshot_local_history() {
+        std::map<uint64_t, std::map<uint64_t, std::set<uint64_t>>> sequences;
+        for (const Segment* segment : store_.segments) {
+            if (segment->meta.status.load(std::memory_order_acquire) ==
+                static_cast<uint8_t>(SegmentStatus::FREE)) continue;
+            const uint64_t worker = segment->meta.owner_id.load(std::memory_order_acquire);
+            const uint64_t tail = segment->meta.tail_idx.load(std::memory_order_acquire);
+            if (worker >= worker_count_ || tail > segment->capacity) {
+                throw std::runtime_error("invalid local recovery segment");
+            }
+            for (uint64_t offset = 0; offset < tail; ++offset) {
+                const ObjectEntry& object = segment->entries[offset];
+                if (object.term_id == 0 || object.term_id >= elected_term_ ||
+                    object.seq_num == 0 || object.key[0] == '\0' ||
+                    !sequences[worker][object.term_id].insert(object.seq_num).second) {
+                    throw std::runtime_error("invalid local recovery record");
+                }
+                ReplicationEntry entry;
+                entry.worker_id = worker;
+                entry.term = object.term_id;
+                entry.sequence = object.seq_num;
+                entry.incarnation = object.incarnation;
+                entry.segment_index = segment->seg_index;
+                entry.object_index = offset;
+                entry.key = std::string(object.key);
+                entry.value = object.value;
+                local_records_.push_back(std::move(entry));
+            }
+        }
+        for (const auto& worker : sequences) {
+            for (const auto& term : worker.second) {
+                uint64_t expected = 1;
+                for (uint64_t sequence : term.second) {
+                    if (sequence != expected++) {
+                        throw std::runtime_error("local recovery stream has a gap");
+                    }
+                }
+                local_progress_[worker.first] =
+                    WorkerProgressWire{worker.first, term.first, *term.second.rbegin()};
+            }
+        }
+    }
 
     static bool later(uint64_t left_term, uint64_t left_sequence,
                       uint64_t right_term, uint64_t right_sequence) {
@@ -162,15 +276,29 @@ private:
             auto peer = std::make_unique<PeerSession>(endpoint);
             peer->socket = connect_to(endpoint.host, endpoint.port);
             if (peer->socket < 0) {
-                DISKEYV_ERROR("RECOVERY",
-                              "replica=" << replica_state_.replica_id
-                                         << " follower-unreachable="
-                                         << endpoint.identity());
-                throw std::runtime_error(
-                    "recovery cannot reach follower " + endpoint.identity());
+                DISKEYV_WARN("RECOVERY",
+                             "replica=" << replica_state_.replica_id
+                                        << " follower-unreachable="
+                                        << endpoint.identity()
+                                        << " action=excluded-from-active-set");
+                continue;
             }
 
-            collect_summary(*peer);
+            try {
+                collect_summary(*peer);
+            } catch (const std::exception& error) {
+                DISKEYV_WARN("RECOVERY",
+                             "replica=" << replica_state_.replica_id
+                                        << " follower-unavailable="
+                                        << endpoint.identity()
+                                        << " reason=" << error.what()
+                                        << " action=excluded-from-active-set");
+                continue;
+            }
+            check_elected_epoch();
+            if (elected_term_ != 0 && peer->current_term > elected_term_) {
+                throw std::runtime_error("recovery peer has a newer election term");
+            }
             DISKEYV_INFO("RECOVERY",
                          "replica=" << replica_state_.replica_id
                                     << " connected=" << endpoint.identity()
@@ -179,6 +307,21 @@ private:
                                     << peer->progress.size());
             peers_.push_back(std::move(peer));
         }
+        const size_t required_remote = required_survivors_ - (elected_term_ != 0 ? 1U : 0U);
+        if (peers_.size() < required_remote) {
+            throw std::runtime_error(
+                "recovery reached " + std::to_string(peers_.size()) +
+                " surviving followers but requires " +
+                std::to_string(required_remote) +
+                " from the configured membership");
+        }
+        DISKEYV_INFO("RECOVERY",
+                     "replica=" << replica_state_.replica_id
+                                << " active-followers=" << peers_.size()
+                                << " required-survivors="
+                                << required_remote
+                                << " configured-members="
+                                << endpoints_.size() + 1);
     }
 
     void collect_summary(PeerSession& peer) {
@@ -189,7 +332,8 @@ private:
         NetMessage reply;
         if (!exchange(peer, request, reply) ||
             reply.type != MsgType::RECOVERY_SUMMARY_REPLY ||
-            reply.status != OperationStatus::OK || reply.term == 0) {
+            reply.status != OperationStatus::OK || reply.term == 0 ||
+            (recovery_term_ != 0 && reply.term != recovery_term_)) {
             throw std::runtime_error(
                 "invalid recovery summary from " + peer.endpoint.identity());
         }
@@ -197,6 +341,7 @@ private:
         peer.progress.clear();
         for (const WorkerProgressWire& progress : reply.worker_progress) {
             if (progress.worker_id >= worker_count_ ||
+                (elected_term_ != 0 && progress.term >= elected_term_) ||
                 !peer.progress.emplace(progress.worker_id, progress).second) {
                 throw std::runtime_error(
                     "invalid worker metadata from " + peer.endpoint.identity());
@@ -205,13 +350,21 @@ private:
     }
 
     void refresh_stable_summaries() {
-        for (const auto& peer : peers_) collect_summary(*peer);
+        for (const auto& peer : peers_) {
+            check_elected_epoch();
+            collect_summary(*peer);
+        }
     }
 
     // Choose the lexicographically greatest <term, sequence> for each worker.
     // This is the static-leader equivalent of LoLKV data consolidation.
     std::vector<SelectedPrefix> select_worker_sources() const {
         std::vector<SelectedPrefix> selected(worker_count_);
+        for (const auto& item : local_progress_) {
+            const WorkerProgressWire& progress = item.second;
+            selected[progress.worker_id] =
+                SelectedPrefix{progress.term, progress.sequence, kLocalSource};
+        }
         for (size_t peer_index = 0; peer_index < peers_.size(); ++peer_index) {
             for (const auto& item : peers_[peer_index]->progress) {
                 const WorkerProgressWire& candidate = item.second;
@@ -233,8 +386,7 @@ private:
             }
             DISKEYV_INFO("RECOVERY",
                          "worker=" << worker_id << " selected="
-                                   << peers_[prefix.peer_index]
-                                          ->endpoint.identity()
+                                   << source_name(prefix)
                                    << " prefix=<" << prefix.term << ','
                                    << prefix.sequence << '>');
         }
@@ -267,6 +419,7 @@ private:
         std::vector<ReplicationEntry> records;
         uint64_t cursor = 0;
         while (true) {
+            check_elected_epoch();
             NetMessage request;
             request.type = MsgType::RECOVERY_FETCH_REQUEST;
             request.worker_id = worker_id;
@@ -280,6 +433,7 @@ private:
             if (!exchange(source, request, reply) ||
                 reply.type != MsgType::RECOVERY_FETCH_REPLY ||
                 reply.status != OperationStatus::OK ||
+                reply.term != recovery_term_ ||
                 reply.worker_id != worker_id || reply.object_index > 1 ||
                 (!reply.object_index && reply.seq <= cursor)) {
                 throw std::runtime_error(
@@ -300,9 +454,17 @@ private:
         return records;
     }
 
-    // Validate uniqueness and per-term contiguity before accepting the chosen
-    // records as canonical. 
-    // Import preserves original segment/object offsets.
+    static bool same_record(const ReplicationEntry& left,
+                            const ReplicationEntry& right) {
+        return left.worker_id == right.worker_id && left.term == right.term &&
+               left.sequence == right.sequence && left.incarnation == right.incarnation &&
+               left.segment_index == right.segment_index &&
+               left.object_index == right.object_index &&
+               left.key == right.key && left.value == right.value;
+    }
+
+    // Validate the full union before importing. A survivor already has part of
+    // the union, so matching local offsets are accepted without appending twice.
     void validate_and_import(
         std::vector<ReplicationEntry>& records,
         const std::vector<SelectedPrefix>& selected) {
@@ -312,6 +474,9 @@ private:
                       return std::tie(left.segment_index, left.object_index) <
                              std::tie(right.segment_index, right.object_index);
                   });
+
+        records.erase(std::unique(records.begin(), records.end(), same_record),
+                      records.end());
 
         std::vector<std::map<uint64_t, std::set<uint64_t>>> sequences(
             worker_count_);
@@ -332,15 +497,6 @@ private:
                 throw std::runtime_error("duplicate object in recovery stream");
             }
 
-            ApplyRecord applied{};
-            if (!PutPath::put_replicated_at(
-                    store_, entry.worker_id,
-                    static_cast<size_t>(entry.segment_index),
-                    entry.object_index, entry.key, entry.value, entry.term,
-                    entry.sequence, entry.incarnation, applied)) {
-                throw std::runtime_error(
-                    "recovery could not reproduce a segment offset");
-            }
         }
 
         for (size_t worker_id = 0; worker_id < worker_count_; ++worker_id) {
@@ -368,6 +524,32 @@ private:
                     "recovery source did not provide its advertised prefix");
             }
         }
+        for (const ReplicationEntry& entry : records) {
+            check_elected_epoch();
+            Segment& segment = *store_.segments[entry.segment_index];
+            if (entry.object_index < segment.meta.tail_idx.load(std::memory_order_acquire)) {
+                if (entry.object_index >= segment.capacity) {
+                    throw std::runtime_error("recovery offset exceeds segment capacity");
+                }
+                const ObjectEntry& existing = segment.entries[entry.object_index];
+                if (segment.meta.owner_id.load(std::memory_order_acquire) != entry.worker_id ||
+                    segment.meta.term_id.load(std::memory_order_acquire) != entry.term ||
+                    existing.term_id != entry.term || existing.seq_num != entry.sequence ||
+                    existing.incarnation != entry.incarnation ||
+                    std::string(existing.key) != entry.key || existing.value != entry.value) {
+                    throw std::runtime_error("conflicting local recovery offset");
+                }
+                continue;
+            }
+            ApplyRecord applied{};
+            if (!PutPath::put_replicated_at(
+                    store_, entry.worker_id,
+                    static_cast<size_t>(entry.segment_index),
+                    entry.object_index, entry.key, entry.value, entry.term,
+                    entry.sequence, entry.incarnation, applied, true)) {
+                throw std::runtime_error("recovery could not reproduce a segment offset");
+            }
+        }
     }
 
     // Send the same canonical physical record set to every follower in bounded
@@ -376,6 +558,7 @@ private:
         for (const auto& peer : peers_) {
             size_t batches = 0;
             for (size_t first = 0; first < records.size();) {
+                check_elected_epoch();
                 size_t last = first;
                 size_t batch_bytes = 0;
                 while (last < records.size() &&
@@ -402,7 +585,8 @@ private:
                 NetMessage reply;
                 if (!exchange(*peer, request, reply) ||
                     reply.type != MsgType::ACK ||
-                    reply.status != OperationStatus::OK) {
+                    reply.status != OperationStatus::OK ||
+                    reply.term != recovery_term_) {
                     throw std::runtime_error(
                         "failed to repair follower " +
                         peer->endpoint.identity());
@@ -469,6 +653,7 @@ private:
 
     void advance_follower_terms(uint64_t new_term) {
         for (const auto& peer : peers_) {
+            check_elected_epoch();
             NetMessage request;
             request.type = MsgType::TERM_ADVANCE;
             request.term = new_term;

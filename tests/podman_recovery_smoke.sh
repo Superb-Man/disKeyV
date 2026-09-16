@@ -14,17 +14,21 @@ network="diskeyv-recovery-$run_id"
 leader="diskeyv-recovery-leader-$run_id"
 follower1="diskeyv-recovery-follower1-$run_id"
 follower2="diskeyv-recovery-follower2-$run_id"
+follower3="diskeyv-recovery-follower3-$run_id"
+follower4="diskeyv-recovery-follower4-$run_id"
 image=${DISKEYV_IMAGE:-diskeyv:local}
 leader_port=${DISKEYV_RECOVERY_LEADER_PORT:-15200}
 follower1_port=${DISKEYV_RECOVERY_FOLLOWER1_PORT:-15201}
 follower2_port=${DISKEYV_RECOVERY_FOLLOWER2_PORT:-15202}
+follower3_port=${DISKEYV_RECOVERY_FOLLOWER3_PORT:-15203}
+follower4_port=${DISKEYV_RECOVERY_FOLLOWER4_PORT:-15204}
 worker_count=${DISKEYV_RECOVERY_WORKERS:-4}
 record_count=${DISKEYV_RECOVERY_RECORDS:-3000}
 loader_count=${DISKEYV_RECOVERY_LOADERS:-16}
 value_size=${DISKEYV_RECOVERY_VALUE_SIZE:-256}
 leader_cpus=${DISKEYV_RECOVERY_LEADER_CPUS:-4}
 follower_cpus=${DISKEYV_RECOVERY_FOLLOWER_CPUS:-2}
-containers=("$leader" "$follower1" "$follower2")
+containers=("$leader" "$follower1" "$follower2" "$follower3" "$follower4")
 
 for numeric_setting in "$worker_count" "$record_count" "$loader_count" \
     "$value_size" "$leader_cpus" "$follower_cpus"; do
@@ -69,6 +73,8 @@ run_client() {
         leader) container=$leader ;;
         follower1) container=$follower1 ;;
         follower2) container=$follower2 ;;
+        follower3) container=$follower3 ;;
+        follower4) container=$follower4 ;;
         *) echo "Unknown replica: $host" >&2; return 2 ;;
     esac
     podman exec -e DISKEYV_HOST=127.0.0.1 "$container" \
@@ -96,6 +102,8 @@ bulk_operation() {
         leader) container=$leader ;;
         follower1) container=$follower1 ;;
         follower2) container=$follower2 ;;
+        follower3) container=$follower3 ;;
+        follower4) container=$follower4 ;;
         *) echo "Unknown replica: $host" >&2; return 2 ;;
     esac
 
@@ -146,7 +154,9 @@ start_leader() {
         -p "127.0.0.1:$leader_port:5000" \
         -e DISKEYV_REPLICA_ID=1 \
         -e "DISKEYV_WORKERS=$worker_count" \
-        "$image" "$mode" 5000 follower1:5000 follower2:5000 >/dev/null
+        -e DISKEYV_ELECTION_ENABLED=0 \
+        "$image" "$mode" 5000 follower1:5000 follower2:5000 \
+        follower3:5000 follower4:5000 >/dev/null
     if [[ "$mode" == "recover" ]]; then
         wait_healthy "$leader" 120
     else
@@ -167,13 +177,14 @@ else
 fi
 podman network create "$network" >/dev/null
 
-echo "[2/7] Start two memory-resident followers"
+echo "[2/7] Start four memory-resident followers"
 podman run --detach --name "$follower1" \
     --network "$network" --network-alias follower1 \
     --init --read-only --tmpfs /tmp:size=16m \
     --security-opt no-new-privileges --cpus "$follower_cpus" --memory 256m \
     -p "127.0.0.1:$follower1_port:5000" \
     -e DISKEYV_REPLICA_ID=2 \
+    -e DISKEYV_ELECTION_ENABLED=0 \
     "$image" follower 5000 >/dev/null
 podman run --detach --name "$follower2" \
     --network "$network" --network-alias follower2 \
@@ -181,16 +192,33 @@ podman run --detach --name "$follower2" \
     --security-opt no-new-privileges --cpus "$follower_cpus" --memory 256m \
     -p "127.0.0.1:$follower2_port:5000" \
     -e DISKEYV_REPLICA_ID=3 \
+    -e DISKEYV_ELECTION_ENABLED=0 \
+    "$image" follower 5000 >/dev/null
+podman run --detach --name "$follower3" \
+    --network "$network" --network-alias follower3 \
+    --init --read-only --tmpfs /tmp:size=16m \
+    --security-opt no-new-privileges --cpus "$follower_cpus" --memory 256m \
+    -p "127.0.0.1:$follower3_port:5000" \
+    -e DISKEYV_REPLICA_ID=4 -e DISKEYV_ELECTION_ENABLED=0 \
+    "$image" follower 5000 >/dev/null
+podman run --detach --name "$follower4" \
+    --network "$network" --network-alias follower4 \
+    --init --read-only --tmpfs /tmp:size=16m \
+    --security-opt no-new-privileges --cpus "$follower_cpus" --memory 256m \
+    -p "127.0.0.1:$follower4_port:5000" \
+    -e DISKEYV_REPLICA_ID=5 -e DISKEYV_ELECTION_ENABLED=0 \
     "$image" follower 5000 >/dev/null
 wait_healthy "$follower1"
 wait_healthy "$follower2"
+wait_healthy "$follower3"
+wait_healthy "$follower4"
 
 echo "[3/7] Commit and replicate term-1 records"
 start_leader leader
 run_client leader put 5000 recovered-key 1,2,3
 run_client leader put 5000 term-one 11
 bulk_operation load leader bulk-
-for replica in leader follower1 follower2; do
+for replica in leader follower1 follower2 follower3 follower4; do
     assert_read "$replica" recovered-key 1 1,2,3
     assert_read "$replica" term-one 1 11
     bulk_operation verify "$replica" bulk- 1
@@ -205,36 +233,45 @@ bulk_operation verify leader bulk- 1
 run_client leader put 5000 recovered-key 4,5,6
 run_client leader put 5000 term-two 22
 bulk_operation load leader bulk-
-for replica in leader follower1 follower2; do
+for replica in leader follower1 follower2 follower3 follower4; do
     assert_read "$replica" recovered-key 2 4,5,6
     assert_read "$replica" term-two 2 22
     bulk_operation verify "$replica" bulk- 2
 done
 
-echo "[5/7] Verify recovery fails closed with one survivor unreachable"
+echo "[5/7] Recover from a majority while one follower is unreachable"
 remove_leader
-podman network disconnect "$network" "$follower2"
-if podman run --rm --network "$network" \
-    -e DISKEYV_REPLICA_ID=1 -e "DISKEYV_WORKERS=$worker_count" \
-    "$image" recover 5000 follower1:5000 follower2:5000 \
-    >/dev/null 2>&1; then
-    echo "FAIL: recovery served without every configured survivor" >&2
-    exit 1
-fi
-assert_read follower1 recovered-key 2 4,5,6
-podman network connect --alias follower2 "$network" "$follower2"
+podman network disconnect "$network" "$follower4"
+start_leader recover
+for replica in leader follower1 follower2 follower3; do
+    assert_read "$replica" recovered-key 2 4,5,6
+    assert_read "$replica" term-two 2 22
+    bulk_operation verify "$replica" bulk- 2
+done
+run_client leader put 5000 majority-recovery 31
+majority_term=$(run_client leader get 5000 majority-recovery | \
+    awk '/^Term:/ {print $2}')
+for replica in leader follower1 follower2 follower3; do
+    assert_read "$replica" majority-recovery "$majority_term" 31
+done
+remove_leader
+podman network connect --alias follower4 "$network" "$follower4"
 
-echo "[6/7] Consolidate again into term 3 and continue writing"
+echo "[6/7] Consolidate again and repair the rejoined follower"
 start_leader recover
 assert_read leader recovered-key 2 4,5,6
 assert_read leader term-one 1 11
 assert_read leader term-two 2 22
+assert_read leader majority-recovery "$majority_term" 31
 bulk_operation verify leader bulk- 2
 run_client leader put 5000 term-three 33
-for replica in leader follower1 follower2; do
-    assert_read "$replica" term-three 3 33
+final_term=$(run_client leader get 5000 term-three | \
+    awk '/^Term:/ {print $2}')
+for replica in leader follower1 follower2 follower3 follower4; do
+    assert_read "$replica" majority-recovery "$majority_term" 31
+    assert_read "$replica" term-three "$final_term" 33
 done
 
 echo "[7/7] Recovery simulation passed: $record_count records, "\
 "$worker_count workers, $loader_count parallel loaders, ports "\
-"$leader_port-$follower2_port, $((SECONDS - test_started)) seconds"
+"$leader_port-$follower4_port, $((SECONDS - test_started)) seconds"

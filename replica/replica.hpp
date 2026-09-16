@@ -8,6 +8,7 @@
 #include <future>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -49,6 +50,12 @@ constexpr size_t kReplicationBatchByteLimit = 256U * 1024U;
 constexpr size_t kReplicationOutstandingBatchWindow = 4;
 constexpr size_t kRequestQueueLimit = 1024;
 constexpr uint64_t kMaxReplicationWorkers = 64;
+constexpr auto kHeartbeatInterval = std::chrono::milliseconds(150);
+// Leave enough margin for replication and verification bursts to occupy the
+// accept/worker threads without turning transient scheduling pressure into a
+// false leader failure.
+constexpr auto kElectionTimeout = std::chrono::milliseconds(3000);
+constexpr auto kElectionPollInterval = std::chrono::milliseconds(50);
 
 // Persistent transport and cumulative progress for one follower. A session is
 // owned by one channel thread, so its socket and prefix need no internal lock.
@@ -97,7 +104,7 @@ struct ReplicationSession {
 
     // Advance this follower through target_sequence. Up to four batches are
     // pipelined, while ACKs are consumed in send order and remain cumulative.
-    bool replicate_to(uint64_t term, uint64_t worker_id,
+    bool replicate_to(uint64_t term, uint64_t leader_id, uint64_t worker_id,
                       size_t target_sequence,
                       const BatchProvider& batch_provider) {
         if (target_sequence == 0) return true;
@@ -105,7 +112,8 @@ struct ReplicationSession {
         while (transport_failures < 2) {
             if (!ensure_connected() ||
                  (!prefix_synchronized &&
-                 !synchronize_prefix(term, worker_id, target_sequence))) {
+                 !synchronize_prefix(term, leader_id, worker_id,
+                                     target_sequence))) {
                 disconnect();
                 ++transport_failures;
                 continue;
@@ -177,11 +185,13 @@ struct ReplicationSession {
 private:
     // Reconnects do not assume the follower retained the last local ACK; ask
     // for its current in-memory prefix before sending missing history.
-    bool synchronize_prefix(uint64_t term, uint64_t worker_id,
+    bool synchronize_prefix(uint64_t term, uint64_t leader_id,
+                            uint64_t worker_id,
                             size_t history_size) {
         NetMessage query;
         query.type = MsgType::PREFIX_QUERY;
         query.term = term;
+        query.sender_id = leader_id;
         query.worker_id = worker_id;
 
         NetMessage reply;
@@ -210,9 +220,10 @@ public:
         uint64_t target_sequence{0}; // Required prefix for this client batch.
     };
 
-    ParallelReplicationGroup(uint64_t term, uint64_t worker_id,
+    ParallelReplicationGroup(uint64_t term, uint64_t leader_id,
+                             uint64_t worker_id,
                              const std::vector<PeerEndpoint>& endpoints)
-        : term_(term), worker_id_(worker_id) {
+        : term_(term), leader_id_(leader_id), worker_id_(worker_id) {
         channels_.reserve(endpoints.size());
         for (const PeerEndpoint& endpoint : endpoints) {
             channels_.push_back(std::make_unique<Channel>(endpoint));
@@ -338,6 +349,7 @@ private:
     };
 
     uint64_t term_;
+    uint64_t leader_id_;
     uint64_t worker_id_;
     std::mutex mutex_;
     std::condition_variable work_cv_;
@@ -353,6 +365,7 @@ private:
         NetMessage batch;
         batch.type = MsgType::PUT_REPL_BATCH;
         batch.term = term_;
+        batch.sender_id = leader_id_;
         batch.worker_id = worker_id_;
         if (first_index >= end_index || end_index > history_.size()) {
             return batch;
@@ -400,7 +413,7 @@ private:
             bool replicated = false;
             try {
                 replicated = channel.session.replicate_to(
-                    term_, worker_id_, target_sequence,
+                    term_, leader_id_, worker_id_, target_sequence,
                     [this](size_t first, size_t last) {
                         return make_batch(first, last);
                     });
@@ -480,6 +493,12 @@ struct Replica {
     std::atomic<int> server_sock{-1};         // Listening socket, or -1 if closed.
     std::vector<PeerEndpoint> peer_endpoints; // Followers used by a leader.
     size_t quorum{1};                         // Majority including this replica.
+    bool election_enabled{false};             // Keeps legacy static mode available.
+    bool campaign_on_start{false};            // Bootstrap role is only a preference.
+    std::thread election_thread;
+    std::mutex campaign_mutex; // Serializes timeout and bootstrap campaigns.
+    std::atomic<uint64_t> last_leader_contact_ms{0};
+    std::atomic<uint64_t> last_majority_contact_ms{0};
     pthread_t net_thread{};
     std::mutex connections_mutex;
     std::vector<std::unique_ptr<ConnectionContext>> connections;
@@ -499,12 +518,14 @@ struct Replica {
             const std::vector<PeerEndpoint>& peers,
             size_t segment_count = 32, uint64_t segment_capacity = 1024,
             size_t index_capacity = 4096,
-            bool recover_from_followers = false)
+            bool recover_from_followers = false,
+            bool enable_election = false)
         : rs(rid, role),
           store(segment_count, segment_capacity),
           ht(index_capacity),
           inc(2048),
-          peer_endpoints(peers) {
+          peer_endpoints(peers),
+          election_enabled(enable_election) {
         if (nworkers <= 0 ||
             static_cast<uint64_t>(nworkers) > kMaxReplicationWorkers) {
             throw std::invalid_argument(
@@ -516,7 +537,11 @@ struct Replica {
                 throw std::invalid_argument("peer endpoints must be unique");
             }
         }
-        if (role == Role::LEADER) {
+        if (election_enabled && rid == 0) {
+            throw std::invalid_argument(
+                "election-enabled replicas need a nonzero replica id");
+        }
+        if (role == Role::LEADER || election_enabled) {
             quorum = (peer_endpoints.size() + 1) / 2 + 1;
         }
         DISKEYV_INFO("REPLICA",
@@ -540,6 +565,21 @@ struct Replica {
             recovering.store(false, std::memory_order_release);
         }
 
+        // A configured leader is only the first candidate. It must win a
+        // majority before serving writes, so two statically configured leaders
+        // cannot both become active in the same term.
+        if (election_enabled) {
+            campaign_on_start = role == Role::LEADER;
+            std::lock_guard<std::mutex> lock(rs.election_mutex);
+            rs.role.store(Role::FOLLOWER, std::memory_order_release);
+            rs.leader_id.store(ReplicaState::kNoReplicaId,
+                               std::memory_order_release);
+            rs.voted_term = 0;
+            rs.voted_for = ReplicaState::kNoReplicaId;
+            last_leader_contact_ms.store(monotonic_milliseconds(),
+                                         std::memory_order_release);
+        }
+
         server_sock.store(create_server(port), std::memory_order_release);
         if (server_sock.load(std::memory_order_acquire) < 0) {
             throw std::runtime_error("failed to create replica server socket");
@@ -547,13 +587,16 @@ struct Replica {
 
         start_workers(nworkers);
         start_network_thread();
+        if (election_enabled) start_election_thread();
         DISKEYV_INFO("REPLICA",
                      "replica=" << rid << " phase=ready role="
-                                << (role == Role::LEADER ? "leader" : "follower")
+                                << role_name(rs.role.load(
+                                       std::memory_order_acquire))
                                 << " port=" << listening_port() << " term="
                                 << rs.current_term.load(std::memory_order_acquire));
         std::cout << "[Replica " << rid << "] listening on port " << port
-                  << " as " << (role == Role::LEADER ? "leader" : "follower")
+                  << " as "
+                  << role_name(rs.role.load(std::memory_order_acquire))
                   << " (quorum " << quorum << ")\n";
     }
 
@@ -577,6 +620,28 @@ struct Replica {
         return nullptr;
     }
 
+    static const char* role_name(Role role) {
+        switch (role) {
+            case Role::LEADER: return "leader";
+            case Role::FOLLOWER: return "follower";
+            case Role::CANDIDATE: return "candidate";
+        }
+        return "unknown";
+    }
+
+    static uint64_t monotonic_milliseconds() {
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+    }
+
+    uint64_t election_timeout_milliseconds() const {
+        // Stable per-replica jitter prevents healthy followers from repeatedly
+        // starting identical-term campaigns at the same instant.
+        return static_cast<uint64_t>(kElectionTimeout.count()) + (rs.replica_id % 7U) * 75U;
+    }
+
     void start_network_thread() {
         if (pthread_create(&net_thread, nullptr, net_entry, this) != 0) {
             DISKEYV_ERROR("REPLICA",
@@ -585,10 +650,415 @@ struct Replica {
             stop.store(true, std::memory_order_release);
             pthread_cond_broadcast(&req_cv);
             for (pthread_t thread : workers) pthread_join(thread, nullptr);
-            const int listening_socket =
-                server_sock.exchange(-1, std::memory_order_acq_rel);
+            const int listening_socket = server_sock.exchange(-1, std::memory_order_acq_rel);
             if (listening_socket >= 0) close(listening_socket);
             throw std::runtime_error("failed to start network thread");
+        }
+    }
+
+    void start_election_thread() {
+        try {
+            election_thread = std::thread([this] { 
+                election_loop(); 
+            });
+        } catch (...) {
+            stop.store(true, std::memory_order_release);
+            const int listening_socket = server_sock.exchange(-1, std::memory_order_acq_rel);
+            if (listening_socket >= 0) {
+                ::shutdown(listening_socket, SHUT_RDWR);
+                close(listening_socket);
+            }
+            pthread_cond_broadcast(&req_cv);
+            pthread_join(net_thread, nullptr);
+            for (pthread_t thread : workers) pthread_join(thread, nullptr);
+            throw;
+        }
+    }
+
+    std::pair<uint64_t, uint64_t> local_segment_freshness() const {
+        std::pair<uint64_t, uint64_t> freshest{0, 0};
+        for (const Segment* segment : store.segments) {
+            if (segment->meta.status.load(std::memory_order_acquire) == static_cast<uint8_t>(SegmentStatus::FREE)) {
+                continue;
+            }
+            freshest = std::max(
+                freshest,
+                std::make_pair(
+                    segment->meta.term_id.load(std::memory_order_acquire),
+                    segment->meta.seg_ver.load(std::memory_order_acquire))
+                );
+        }
+        return freshest;
+    }
+
+    static bool exchange_election_message(const PeerEndpoint& endpoint,
+                                          const NetMessage& request,
+                                          NetMessage& reply) {
+        const int socket = connect_to(endpoint.host, endpoint.port);
+        if (socket < 0) return false;
+        const bool exchanged = send_message(socket, request) && recv_message(socket, reply);
+        ::shutdown(socket, SHUT_RDWR);
+        close(socket);
+        return exchanged;
+    }
+
+    void observe_higher_term(uint64_t observed_term) {
+        std::lock_guard<std::mutex> lock(rs.election_mutex);
+        const uint64_t current = rs.current_term.load(std::memory_order_acquire);
+        if (observed_term <= current) return;
+        rs.current_term.store(observed_term, std::memory_order_release);
+        rs.role.store(Role::FOLLOWER, std::memory_order_release);
+        rs.leader_id.store(ReplicaState::kNoReplicaId,
+                           std::memory_order_release);
+        rs.voted_term = 0;
+        rs.voted_for = ReplicaState::kNoReplicaId;
+        last_leader_contact_ms.store(monotonic_milliseconds(), std::memory_order_release);
+        pthread_cond_broadcast(&req_cv);
+    }
+
+    void handle_heartbeat(int sock, const NetMessage& msg) {
+        NetMessage reply;
+        reply.type = MsgType::HEARTBEAT_REPLY;
+        reply.sender_id = rs.replica_id;
+        reply.status = OperationStatus::INVALID_REQUEST;
+        {
+            std::lock_guard<std::mutex> lock(rs.election_mutex);
+            const uint64_t current = rs.current_term.load(std::memory_order_acquire);
+            if (election_enabled && msg.sender_id != rs.replica_id &&
+                msg.term >= current) {
+                if (msg.term > current) {
+                    rs.current_term.store(msg.term, std::memory_order_release);
+                    rs.voted_term = 0;
+                    rs.voted_for = ReplicaState::kNoReplicaId;
+                }
+                rs.role.store(Role::FOLLOWER, std::memory_order_release);
+                rs.leader_id.store(msg.sender_id, std::memory_order_release);
+                last_leader_contact_ms.store(monotonic_milliseconds(), std::memory_order_release);
+                reply.status = OperationStatus::OK;
+            }
+            reply.term = rs.current_term.load(std::memory_order_acquire);
+        }
+        if (reply.status == OperationStatus::OK) {
+            pthread_cond_broadcast(&req_cv);
+        }
+        send_message(sock, reply);
+    }
+
+    void handle_vote_request(int sock, const NetMessage& msg) {
+        NetMessage reply;
+        reply.type = MsgType::VOTE_REPLY;
+        reply.sender_id = rs.replica_id;
+        reply.status = OperationStatus::INVALID_REQUEST;
+        const auto freshness = local_segment_freshness();
+        reply.last_segment_term = freshness.first;
+        reply.last_segment_version = freshness.second;
+        {
+            std::lock_guard<std::mutex> lock(rs.election_mutex);
+            uint64_t current = rs.current_term.load(std::memory_order_acquire);
+            if (election_enabled && msg.sender_id != rs.replica_id &&
+                msg.term >= current) {
+                if (msg.term > current) {
+                    current = msg.term;
+                    rs.current_term.store(current, std::memory_order_release);
+                    rs.role.store(Role::FOLLOWER, std::memory_order_release);
+                    rs.leader_id.store(ReplicaState::kNoReplicaId,
+                                       std::memory_order_release);
+                    rs.voted_term = 0;
+                    rs.voted_for = ReplicaState::kNoReplicaId;
+                }
+                const bool candidate_is_current = std::make_pair(msg.last_segment_term, msg.last_segment_version) >= freshness;
+                const bool vote_available = rs.voted_term != current ||
+                                            rs.voted_for == ReplicaState::kNoReplicaId ||
+                                            rs.voted_for == msg.sender_id;
+                if (candidate_is_current && vote_available) {
+                    rs.voted_term = current;
+                    rs.voted_for = msg.sender_id;
+                    rs.role.store(Role::FOLLOWER, std::memory_order_release);
+                    rs.leader_id.store(ReplicaState::kNoReplicaId, std::memory_order_release);
+                    last_leader_contact_ms.store(monotonic_milliseconds(), std::memory_order_release);
+                    reply.status = OperationStatus::OK;
+                }
+            }
+            reply.term = rs.current_term.load(std::memory_order_acquire);
+        }
+        send_message(sock, reply);
+    }
+
+    // A pre-vote is a read-only reachability and freshness check. In
+    // particular, it does not advance the receiver's term or consume its vote.
+    void handle_pre_vote_request(int sock, const NetMessage& msg) {
+        NetMessage reply;
+        reply.type = MsgType::PRE_VOTE_REPLY;
+        reply.sender_id = rs.replica_id;
+        reply.status = OperationStatus::INVALID_REQUEST;
+        const auto freshness = local_segment_freshness();
+        reply.last_segment_term = freshness.first;
+        reply.last_segment_version = freshness.second;
+        {
+            std::lock_guard<std::mutex> lock(rs.election_mutex);
+            const uint64_t current =
+                rs.current_term.load(std::memory_order_acquire);
+            const uint64_t leader =
+                rs.leader_id.load(std::memory_order_acquire);
+            const uint64_t now = monotonic_milliseconds();
+            const bool leader_lease_active =
+                leader != ReplicaState::kNoReplicaId &&
+                now - last_leader_contact_ms.load(std::memory_order_acquire) <
+                    election_timeout_milliseconds();
+            if (election_enabled && msg.sender_id != rs.replica_id &&
+                msg.term >= current + 1 && !leader_lease_active &&
+                std::make_pair(msg.last_segment_term,
+                               msg.last_segment_version) >= freshness) {
+                reply.status = OperationStatus::OK;
+            }
+            reply.term = current;
+        }
+        send_message(sock, reply);
+    }
+
+    std::vector<std::future<std::pair<bool, NetMessage>>>
+    send_election_rpc_to_peers(const NetMessage& request) {
+        std::vector<std::future<std::pair<bool, NetMessage>>> futures;
+        futures.reserve(peer_endpoints.size());
+        for (const PeerEndpoint& endpoint : peer_endpoints) {
+            futures.push_back(std::async(
+                std::launch::async, [endpoint, request] {
+                    NetMessage reply;
+                    const bool ok = exchange_election_message(endpoint, request, reply);
+                    return std::make_pair(ok, std::move(reply));
+                }));
+        }
+        return futures;
+    }
+
+    void run_campaign() {
+        std::lock_guard<std::mutex> campaign_lock(campaign_mutex);
+        if (stop.load(std::memory_order_acquire)) return;
+
+        const uint64_t current_term = rs.current_term.load(std::memory_order_acquire);
+        const auto freshness = local_segment_freshness();
+        NetMessage pre_vote;
+        pre_vote.type = MsgType::PRE_VOTE_REQUEST;
+        pre_vote.term = current_term + 1;
+        pre_vote.sender_id = rs.replica_id;
+        pre_vote.last_segment_term = freshness.first;
+        pre_vote.last_segment_version = freshness.second;
+
+        size_t pre_votes = 1;
+        std::unordered_set<uint64_t> pre_voters{rs.replica_id};
+        auto pre_vote_futures = send_election_rpc_to_peers(pre_vote);
+        for (auto& future : pre_vote_futures) {
+            const auto result = future.get();
+            if (!result.first ||
+                result.second.type != MsgType::PRE_VOTE_REPLY) {
+                continue;
+            }
+            const NetMessage& reply = result.second;
+            if (reply.term > current_term) {
+                observe_higher_term(reply.term);
+                return;
+            }
+            if (reply.status == OperationStatus::OK &&
+                pre_voters.insert(reply.sender_id).second) {
+                ++pre_votes;
+            }
+        }
+        if (pre_votes < quorum) {
+            DISKEYV_DEBUG("ELECTION",
+                          "replica=" << rs.replica_id
+                                     << " state=pre-vote-lost term="
+                                     << pre_vote.term << " votes=" << pre_votes
+                                     << " quorum=" << quorum);
+            return;
+        }
+
+        uint64_t campaign_term = 0;
+        {
+            std::lock_guard<std::mutex> lock(rs.election_mutex);
+            campaign_term = rs.current_term.load(std::memory_order_acquire) + 1;
+            rs.current_term.store(campaign_term, std::memory_order_release);
+            rs.role.store(Role::CANDIDATE, std::memory_order_release);
+            rs.leader_id.store(ReplicaState::kNoReplicaId, std::memory_order_release);
+            rs.voted_term = campaign_term;
+            rs.voted_for = rs.replica_id;
+            last_leader_contact_ms.store(monotonic_milliseconds(), std::memory_order_release);
+        }
+
+        NetMessage request;
+        request.type = MsgType::VOTE_REQUEST;
+        request.term = campaign_term;
+        request.sender_id = rs.replica_id;
+        request.last_segment_term = freshness.first;
+        request.last_segment_version = freshness.second;
+
+        size_t votes = 1;
+        std::unordered_set<uint64_t> voters{rs.replica_id};
+        auto futures = send_election_rpc_to_peers(request);
+        for (auto& future : futures) {
+            const auto result = future.get();
+            if (!result.first || result.second.type != MsgType::VOTE_REPLY) {
+                continue;
+            }
+            const NetMessage& reply = result.second;
+            if (reply.term > campaign_term) {
+                observe_higher_term(reply.term);
+                return;
+            }
+            if (reply.term == campaign_term && reply.status == OperationStatus::OK && voters.insert(reply.sender_id).second) {
+                ++votes;
+            }
+        }
+
+        std::unique_lock<std::mutex> lock(rs.election_mutex);
+        if (votes >= quorum &&
+            rs.current_term.load(std::memory_order_acquire) == campaign_term &&
+            rs.role.load(std::memory_order_acquire) == Role::CANDIDATE) {
+
+            // Keep CANDIDATE until recovery finishes. Heartbeats identify the
+            // election winner, but LEADER means it is ready to serve clients.
+            recovering.store(true, std::memory_order_release);
+            rs.leader_id.store(rs.replica_id, std::memory_order_release);
+            last_majority_contact_ms.store(monotonic_milliseconds(),
+                                           std::memory_order_release);
+            DISKEYV_INFO("ELECTION",
+                         "replica=" << rs.replica_id << " state=leader-recovering term="
+                                    << campaign_term << " votes=" << votes
+                                    << " quorum=" << quorum);
+            lock.unlock();
+            consolidate_elected_leader(campaign_term);
+        } else {
+            DISKEYV_DEBUG("ELECTION",
+                          "replica=" << rs.replica_id
+                                     << " state=campaign-lost term="
+                                     << campaign_term << " votes=" << votes
+                                     << " quorum=" << quorum);
+        }
+    }
+
+    // Keep the election thread sending heartbeats while the existing coordinator
+    // does blocking recovery I/O. The scoped future is joined before returning.
+    void consolidate_elected_leader(uint64_t term) {
+        try {
+            send_heartbeats(); // Tell followers who won before authorizing repair.
+            auto recovery = std::async(std::launch::async, [this, term] {
+                // Wait for old local PUTs and follower installs to finish, then
+                // keep storage stable throughout snapshot, import, and repair.
+                std::unique_lock<std::shared_mutex> epoch_lock(replication_epoch_mutex);
+                RecoveryCoordinator coordinator(rs, store, ht, peer_endpoints, workers.size());
+                coordinator.recover_elected(term);
+                reconstruct_worker_progress_locked();
+            });
+            while (recovery.wait_for(kHeartbeatInterval) != std::future_status::ready &&
+                   !stop.load(std::memory_order_acquire)) {
+                send_heartbeats();
+            }
+            recovery.get(); // Propagate recovery failure before allowing clients.
+
+            std::lock_guard<std::mutex> lock(rs.election_mutex);
+            if (stop.load(std::memory_order_acquire) ||
+                rs.current_term.load(std::memory_order_acquire) != term ||
+                rs.role.load(std::memory_order_acquire) != Role::CANDIDATE ||
+                rs.leader_id.load(std::memory_order_acquire) != rs.replica_id) {
+                throw std::runtime_error("leadership lost before recovery completed");
+            }
+            rs.role.store(Role::LEADER, std::memory_order_release);
+            recovering.store(false, std::memory_order_release);
+            DISKEYV_INFO("ELECTION", "replica=" << rs.replica_id
+                         << " state=leader term=" << term << " recovery=complete");
+            pthread_cond_broadcast(&req_cv);
+        } catch (const std::exception& error) {
+            std::lock_guard<std::mutex> lock(rs.election_mutex);
+            if (rs.current_term.load(std::memory_order_acquire) == term &&
+                    rs.role.load(std::memory_order_acquire) == Role::CANDIDATE) {
+
+                rs.role.store(Role::FOLLOWER, std::memory_order_release);
+                rs.leader_id.store(ReplicaState::kNoReplicaId, std::memory_order_release);
+                last_leader_contact_ms.store(monotonic_milliseconds(), std::memory_order_release);
+            }
+            // Keep client reads/writes gated if the local rebuild was incomplete.
+            DISKEYV_WARN("RECOVERY", "replica=" << rs.replica_id
+                         << " phase=failed term=" << term << " reason=" << error.what());
+        }
+    }
+
+    void send_heartbeats() {
+        const uint64_t term = rs.current_term.load(std::memory_order_acquire);
+        const Role role = rs.role.load(std::memory_order_acquire);
+        if (role != Role::LEADER &&
+            !(role == Role::CANDIDATE && recovering.load(std::memory_order_acquire) &&
+                rs.leader_id.load(std::memory_order_acquire) == rs.replica_id)) {
+                return;
+              }
+
+        const auto freshness = local_segment_freshness();
+        NetMessage request;
+        request.type = MsgType::HEARTBEAT;
+        request.term = term;
+        request.sender_id = rs.replica_id;
+        request.last_segment_term = freshness.first;
+        request.last_segment_version = freshness.second;
+
+        size_t acknowledgements = 1;
+        std::unordered_set<uint64_t> responders{rs.replica_id};
+        auto futures = send_election_rpc_to_peers(request);
+        for (auto& future : futures) {
+            const auto result = future.get();
+            if (!result.first ||
+                result.second.type != MsgType::HEARTBEAT_REPLY) {
+                continue;
+            }
+            const NetMessage& reply = result.second;
+            if (reply.term > term) {
+                observe_higher_term(reply.term);
+                return;
+            }
+            if (reply.term == term && reply.status == OperationStatus::OK &&
+                responders.insert(reply.sender_id).second) {
+                ++acknowledgements;
+            }
+        }
+
+        const uint64_t now = monotonic_milliseconds();
+        if (acknowledgements >= quorum) {
+            last_majority_contact_ms.store(now, std::memory_order_release);
+            return;
+        }
+        const uint64_t last_majority = last_majority_contact_ms.load(std::memory_order_acquire);
+        if (now - last_majority < election_timeout_milliseconds()) return;
+
+        std::lock_guard<std::mutex> lock(rs.election_mutex);
+        if (rs.current_term.load(std::memory_order_acquire) == term &&
+            rs.leader_id.load(std::memory_order_acquire) == rs.replica_id) {
+            rs.role.store(Role::FOLLOWER, std::memory_order_release);
+            rs.leader_id.store(ReplicaState::kNoReplicaId, std::memory_order_release);
+            last_leader_contact_ms.store(now, std::memory_order_release);
+            DISKEYV_WARN("ELECTION",
+                         "replica=" << rs.replica_id
+                                    << " state=stepped-down term=" << term
+                                    << " acknowledgements=" << acknowledgements
+                                    << " quorum=" << quorum);
+            pthread_cond_broadcast(&req_cv);
+        }
+    }
+
+    void election_loop() {
+        if (campaign_on_start) run_campaign();
+        uint64_t last_heartbeat = 0;
+        while (!stop.load(std::memory_order_acquire)) {
+            const uint64_t now = monotonic_milliseconds();
+            const Role role = rs.role.load(std::memory_order_acquire);
+            if (role == Role::LEADER) {
+                if (now - last_heartbeat >= static_cast<uint64_t>(kHeartbeatInterval.count())) {
+                    last_heartbeat = now;
+                    send_heartbeats();
+                }
+            } else {
+                const uint64_t last_contact = last_leader_contact_ms.load(std::memory_order_acquire);
+                if (now - last_contact >= election_timeout_milliseconds()) {
+                    run_campaign();
+                }
+            }
+            std::this_thread::sleep_for(kElectionPollInterval);
         }
     }
 
@@ -682,6 +1152,15 @@ struct Replica {
             case MsgType::TERM_ADVANCE:
                 handle_term_advance(sock, msg);
                 break;
+            case MsgType::HEARTBEAT:
+                handle_heartbeat(sock, msg);
+                break;
+            case MsgType::VOTE_REQUEST:
+                handle_vote_request(sock, msg);
+                break;
+            case MsgType::PRE_VOTE_REQUEST:
+                handle_pre_vote_request(sock, msg);
+                break;
             case MsgType::CLIENT_HEALTH: {
                 NetMessage reply;
                 reply.type = MsgType::CLIENT_HEALTH_REPLY;
@@ -729,6 +1208,7 @@ struct Replica {
     }
 
     void handle_client_get(int sock, const NetMessage& msg) {
+        std::shared_lock<std::shared_mutex> epoch_lock(replication_epoch_mutex);
         NetMessage reply;
         reply.type = MsgType::CLIENT_GET_REPLY;
         if (recovering.load(std::memory_order_acquire)) {
@@ -757,11 +1237,12 @@ struct Replica {
         reply.term = msg.term;
         reply.worker_id = msg.worker_id;
 
-        const bool valid_request =
-            rs.role.load(std::memory_order_acquire) == Role::FOLLOWER &&
-            msg.term == rs.current_term.load(std::memory_order_acquire) &&
-            !msg.key.empty() && msg.key.size() <= ObjectEntry::kMaxKeySize &&
-            msg.seq > 0 && msg.worker_id < kMaxReplicationWorkers;
+        const bool valid_request = rs.role.load(std::memory_order_acquire) == Role::FOLLOWER &&
+                                   msg.term == rs.current_term.load(std::memory_order_acquire) &&
+                                   (!election_enabled ||
+                                   msg.sender_id == rs.leader_id.load(std::memory_order_acquire)) &&
+                                   !msg.key.empty() && msg.key.size() <= ObjectEntry::kMaxKeySize &&
+                                   msg.seq > 0 && msg.worker_id < kMaxReplicationWorkers;
         if (!valid_request) {
             DISKEYV_WARN("FOLLOWER",
                          "replica=" << rs.replica_id
@@ -801,6 +1282,8 @@ struct Replica {
         const bool valid_request =
             rs.role.load(std::memory_order_acquire) == Role::FOLLOWER &&
             msg.term == rs.current_term.load(std::memory_order_acquire) &&
+            (!election_enabled ||
+             msg.sender_id == rs.leader_id.load(std::memory_order_acquire)) &&
             msg.worker_id < kMaxReplicationWorkers && !msg.entries.empty() &&
             msg.entries.size() <= kReplicationBatchEntryLimit &&
             msg.entries.front().sequence == msg.seq;
@@ -879,6 +1362,8 @@ struct Replica {
         reply.worker_id = msg.worker_id;
         if (rs.role.load(std::memory_order_acquire) != Role::FOLLOWER ||
             msg.term != rs.current_term.load(std::memory_order_acquire) ||
+            (election_enabled &&
+             msg.sender_id != rs.leader_id.load(std::memory_order_acquire)) ||
             msg.worker_id >= kMaxReplicationWorkers) {
             DISKEYV_WARN("FOLLOWER",
                          "replica=" << rs.replica_id
@@ -901,8 +1386,7 @@ struct Replica {
     }
 
     void handle_recovery_summary(int sock, const NetMessage& msg) {
-        std::unique_lock<std::shared_mutex> epoch_lock(
-            replication_epoch_mutex);
+        std::unique_lock<std::shared_mutex> epoch_lock(replication_epoch_mutex);
         NetMessage reply;
         reply.type = MsgType::RECOVERY_SUMMARY_REPLY;
         reply.term = rs.current_term.load(std::memory_order_acquire);
@@ -975,8 +1459,7 @@ struct Replica {
             const Segment& segment = *store.segments[segment_index];
             if (segment.meta.owner_id.load(std::memory_order_acquire) !=
                     msg.worker_id ||
-                object_index >=
-                    segment.meta.tail_idx.load(std::memory_order_acquire)) {
+                object_index >= segment.meta.tail_idx.load(std::memory_order_acquire)) {
                 continue;
             }
             std::atomic_thread_fence(std::memory_order_acquire);
@@ -996,8 +1479,7 @@ struct Replica {
             entry.value = object.value;
             entry.term = object.term_id;
             entry.worker_id = msg.worker_id;
-            const size_t entry_bytes = entry.key.size() + entry.value.size() +
-                                       8U * sizeof(uint64_t);
+            const size_t entry_bytes = entry.key.size() + entry.value.size() + 8U * sizeof(uint64_t);
             if (!reply.entries.empty() &&
                 reply_bytes + entry_bytes > kMaxWireRecoveryBatchBytes) {
                 cursor = flat_index;
@@ -1066,14 +1548,17 @@ struct Replica {
         std::unique_lock<std::shared_mutex> epoch_lock(
             replication_epoch_mutex
         );
+        std::lock_guard<std::mutex> election_lock(rs.election_mutex);
         NetMessage reply;
         reply.type = MsgType::TERM_ADVANCE_REPLY;
         const uint64_t current = rs.current_term.load(std::memory_order_acquire);
-        const bool valid_role =
-            rs.role.load(std::memory_order_acquire) == Role::FOLLOWER;
-        if (!valid_role || msg.term < current || msg.incarnation == 0 ||
-            (msg.term == current && recovery_leader_id != 0 &&
-             recovery_leader_id != msg.incarnation)) {
+        const bool valid_role = rs.role.load(std::memory_order_acquire) == Role::FOLLOWER;
+        const bool authorized = election_enabled ? msg.term == current &&
+                                msg.incarnation == rs.leader_id.load(std::memory_order_acquire)
+                                : !(msg.term == current && recovery_leader_id != 0 &&
+                                recovery_leader_id != msg.incarnation);
+        
+        if (!valid_role || msg.term < current || msg.incarnation == 0 || !authorized) {
             DISKEYV_WARN("RECOVERY",
                          "replica=" << rs.replica_id
                                     << " rejected=term-advance current="
@@ -1086,13 +1571,15 @@ struct Replica {
         }
 
         recovery_leader_id = msg.incarnation;
-        if (msg.term > current) {
-            for (Segment* segment : store.segments) {
-                if (segment->meta.status.load(std::memory_order_acquire) == static_cast<uint8_t>(SegmentStatus::ACTIVE) &&
-                    segment->meta.term_id.load(std::memory_order_acquire) < msg.term) {
-                    segment->seal();
-                }
+        // Election may already have advanced current_term. Old segments still
+        // need sealing when recovery authorizes the leader in that same term.
+        for (Segment* segment : store.segments) {
+            if (segment->meta.status.load(std::memory_order_acquire) == static_cast<uint8_t>(SegmentStatus::ACTIVE) &&
+                segment->meta.term_id.load(std::memory_order_acquire) < msg.term) {
+                segment->seal();
             }
+        }
+        if (msg.term > current) {
             rs.current_term.store(msg.term, std::memory_order_release);
         }
         DISKEYV_INFO("RECOVERY",
@@ -1283,11 +1770,8 @@ struct Replica {
         DISKEYV_DEBUG("WORKER",
                       "replica=" << rs.replica_id << " worker="
                                  << worker.worker_id << " state=started");
-        ParallelReplicationGroup replication(
-            rs.current_term.load(std::memory_order_acquire), 
-            worker.worker_id,
-            peer_endpoints
-        );
+        std::unique_ptr<ParallelReplicationGroup> replication;
+        uint64_t worker_term = 0;
         std::deque<ApplyRecord> pending;
         uint64_t produced_sequence = 0;
 
@@ -1323,6 +1807,58 @@ struct Replica {
             }
             pthread_mutex_unlock(&req_mtx);
             pthread_cond_broadcast(&req_space_cv);
+
+            auto complete_batch = [&requests](OperationStatus status) {
+                for (Request& request : requests) {
+                    request.completion->set_value(status);
+                }
+            };
+
+            // Recovery takes the exclusive side of this barrier. Holding it
+            // through publication also drains old-term requests before import.
+            std::shared_lock<std::shared_mutex> epoch_lock(replication_epoch_mutex);
+            if (recovering.load(std::memory_order_acquire)) {
+                complete_batch(OperationStatus::RECOVERING);
+                continue;
+            }
+            const uint64_t observed_term =
+                rs.current_term.load(std::memory_order_acquire);
+            if (rs.role.load(std::memory_order_acquire) != Role::LEADER) {
+                complete_batch(OperationStatus::NOT_LEADER);
+                continue;
+            }
+
+            if (!replication || worker_term != observed_term) {
+                replication.reset();
+                const uint64_t active =
+                    worker.active_segment.load(std::memory_order_acquire);
+                if (active != UINT64_MAX && active < store.segments.size() &&
+                    store.segments[active]->meta.status.load(
+                        std::memory_order_acquire) ==
+                        static_cast<uint8_t>(SegmentStatus::ACTIVE)) {
+                    store.segments[active]->seal();
+                }
+                worker.active_segment.store(UINT64_MAX,
+                                            std::memory_order_release);
+                worker.sequence_number.store(0, std::memory_order_release);
+                pending.clear();
+                produced_sequence = 0;
+                replication = std::make_unique<ParallelReplicationGroup>(
+                    observed_term, rs.replica_id, worker.worker_id,
+                    peer_endpoints);
+                worker_term = observed_term;
+            }
+
+            // Keep one local append batch in a single leadership term. The
+            // lock is released before network I/O, allowing a higher-term vote
+            // or heartbeat to fence this worker while replication is pending.
+            std::unique_lock<std::mutex> election_lock(rs.election_mutex);
+            if (rs.role.load(std::memory_order_acquire) != Role::LEADER ||
+                rs.current_term.load(std::memory_order_acquire) != worker_term) {
+                election_lock.unlock();
+                complete_batch(OperationStatus::NOT_LEADER);
+                continue;
+            }
 
             struct PreparedPut {
                 Request request;
@@ -1361,7 +1897,10 @@ struct Replica {
                 prepared.push_back(
                     PreparedPut{std::move(request), record, sequence});
             }
-            if (prepared.empty()) continue;
+            if (prepared.empty()) {
+                election_lock.unlock();
+                continue;
+            }
 
             std::vector<ApplyRecord> replication_records;
             replication_records.reserve(prepared.size());
@@ -1369,9 +1908,22 @@ struct Replica {
                 replication_records.push_back(put.record);
             }
             const ParallelReplicationGroup::Ticket ticket =
-                replication.publish(replication_records, store);
+                replication->publish(replication_records, store);
+            election_lock.unlock();
             const uint64_t commit_watermark =
-                replication.wait_for_commit(ticket, quorum);
+                replication->wait_for_commit(ticket, quorum);
+
+            // A quorum ACK from an obsolete term must never publish data after
+            // this process has observed another leader or started a campaign.
+            if (rs.role.load(std::memory_order_acquire) != Role::LEADER ||
+                rs.current_term.load(std::memory_order_acquire) != worker_term) {
+                pending.clear();
+                for (PreparedPut& put : prepared) {
+                    put.request.completion->set_value(
+                        OperationStatus::NOT_LEADER);
+                }
+                continue;
+            }
             std::unordered_map<uint64_t, IndexApplyResult> publications;
 
             // pending can contain earlier locally appended records that did
@@ -1488,6 +2040,7 @@ struct Replica {
         }
         pthread_cond_broadcast(&req_cv);
         pthread_cond_broadcast(&req_space_cv);
+        if (election_thread.joinable()) election_thread.join();
         pthread_join(net_thread, nullptr);
         for (pthread_t thread : workers) pthread_join(thread, nullptr);
 
