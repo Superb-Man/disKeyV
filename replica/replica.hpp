@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <cstring>
 #include <deque>
 #include <future>
 #include <functional>
@@ -36,6 +37,7 @@
 #include "../network/socket_utils.hpp"
 #include "../recovery/recovery_coordinator.hpp"
 #include "../storage/segment_store.hpp"
+#include "../storage/segment_gc.hpp"
 
 struct Request {
     std::string key;
@@ -71,6 +73,7 @@ struct ReplicationSession {
     int socket{-1};                     // -1 means disconnected.
     uint64_t highest_acked{0};          // Cumulative contiguous follower ACK.
     bool prefix_synchronized{false};    // Prefix query completed on this socket.
+    uint64_t layout_version{0};
 
     void disconnect() {
         if (socket < 0) return;
@@ -106,14 +109,15 @@ struct ReplicationSession {
     // pipelined, while ACKs are consumed in send order and remain cumulative.
     bool replicate_to(uint64_t term, uint64_t leader_id, uint64_t worker_id,
                       size_t target_sequence,
-                      const BatchProvider& batch_provider) {
+                      const BatchProvider& batch_provider,
+                      const SegmentStore& store) {
         if (target_sequence == 0) return true;
         int transport_failures = 0;
         while (transport_failures < 2) {
             if (!ensure_connected() ||
-                 (!prefix_synchronized &&
+                 ((!prefix_synchronized || layout_version != store.layout_version.load()) &&
                  !synchronize_prefix(term, leader_id, worker_id,
-                                     target_sequence))) {
+                                     target_sequence, store))) {
                 disconnect();
                 ++transport_failures;
                 continue;
@@ -187,21 +191,32 @@ private:
     // for its current in-memory prefix before sending missing history.
     bool synchronize_prefix(uint64_t term, uint64_t leader_id,
                             uint64_t worker_id,
-                            size_t history_size) {
+                            size_t history_size, const SegmentStore& store) {
         NetMessage query;
         query.type = MsgType::PREFIX_QUERY;
         query.term = term;
         query.sender_id = leader_id;
         query.worker_id = worker_id;
+        query.layout_version = store.layout_version.load();
 
         NetMessage reply;
         if (!send_message(socket, query) || !recv_message(socket, reply) ||
-            reply.type != MsgType::PREFIX_REPLY ||
+            reply.type != MsgType::PREFIX_REPLY || reply.term != term) return false;
+        if (reply.status == OperationStatus::OUT_OF_ORDER) {
+            if (!transfer_segment_state(socket, term, leader_id, [&] {
+                    std::lock_guard<std::mutex> lock(store.data_mutex);
+                    return SegmentState::capture(store);
+                })) return false;
+            query.layout_version = store.layout_version.load();
+            if (!send_message(socket, query) || !recv_message(socket, reply)) return false;
+        }
+        if (reply.type != MsgType::PREFIX_REPLY ||
             reply.status != OperationStatus::OK || reply.term != term ||
-            reply.worker_id != worker_id || reply.seq > history_size) {
+            reply.worker_id != worker_id || reply.layout_version != query.layout_version) {
             return false;
         }
-        highest_acked = reply.seq;
+        highest_acked = std::min<uint64_t>(reply.seq, history_size);
+        layout_version = reply.layout_version;
         prefix_synchronized = true;
         DISKEYV_DEBUG("REPLICATION",
                       "follower=" << endpoint.identity()
@@ -222,8 +237,9 @@ public:
 
     ParallelReplicationGroup(uint64_t term, uint64_t leader_id,
                              uint64_t worker_id,
-                             const std::vector<PeerEndpoint>& endpoints)
-        : term_(term), leader_id_(leader_id), worker_id_(worker_id) {
+                             const std::vector<PeerEndpoint>& endpoints,
+                             const SegmentStore& store)
+        : store_(store), term_(term), leader_id_(leader_id), worker_id_(worker_id) {
         channels_.reserve(endpoints.size());
         for (const PeerEndpoint& endpoint : endpoints) {
             channels_.push_back(std::make_unique<Channel>(endpoint));
@@ -266,31 +282,34 @@ public:
     ParallelReplicationGroup& operator=(const ParallelReplicationGroup&) =
         delete;
 
-    // Copy immutable SegmentStore objects into replayable wire history before
-    // waking follower channels. History indices correspond to sequence - 1.
-    Ticket publish(const std::vector<ApplyRecord>& records,
-                   const SegmentStore& store) {
+    // Adjacent objects share one replay range per segment allocation. Values
+    // remain in SegmentStore; metadata no longer grows once per PUT.
+    Ticket publish(const std::vector<ApplyRecord>& records) {
         std::lock_guard<std::mutex> lock(mutex_);
+        refresh_ranges_locked();
         for (const ApplyRecord& record : records) {
-            const ObjectEntry& object =
-                store.segments[record.seg_idx]->entries[record.obj_idx];
-            if (object.term_id != term_ ||
-                object.seq_num != history_.size() + 1) {
+            const Segment& segment = *store_.segments[record.seg_idx];
+            const ObjectEntry& object = segment.entries[record.obj_idx];
+            if (record.worker_id != worker_id_ || object.term_id != term_ ||
+                object.seq_num != published_sequence_ + 1) {
                 throw std::runtime_error(
-                    "worker replication history is not contiguous");
+                    "worker replication sequence is not contiguous");
             }
-            ReplicationEntry entry;
-            entry.sequence = object.seq_num;
-            entry.incarnation = object.incarnation;
-            entry.segment_index = record.seg_idx;
-            entry.object_index = record.obj_idx;
-            entry.key = std::string(object.key);
-            entry.value = object.value;
-            history_.push_back(std::move(entry));
+            const uint64_t version = segment.meta.seg_ver.load(std::memory_order_acquire);
+            if (!replay_segments_.empty() &&
+                replay_segments_.back().segment_index == record.seg_idx &&
+                replay_segments_.back().segment_version == version &&
+                replay_segments_.back().first_object_index +
+                    (published_sequence_ - replay_segments_.back().first_index) ==
+                        record.obj_idx) {
+                ++replay_segments_.back().end_index;
+            } else {
+                replay_segments_.push_back({record.seg_idx, version, published_sequence_, record.obj_idx, published_sequence_ + 1});
+            }
+            ++published_sequence_;
         }
         ++generation_;
-        const Ticket ticket{generation_,
-                            static_cast<uint64_t>(history_.size())};
+        const Ticket ticket{generation_, static_cast<uint64_t>(published_sequence_)};
         work_cv_.notify_all();
         return ticket;
     }
@@ -346,8 +365,18 @@ private:
         uint64_t prefix{0};               // Last ACK copied from the session.
         uint64_t completed_generation{0}; // Last publication attempt finished.
         bool failure_active{false};       // Suppresses repeated outage warnings.
+        uint64_t layout_version{0};
     };
 
+    struct ReplaySegment {
+        size_t segment_index;
+        uint64_t segment_version; // Detect a retired/reused physical segment.
+        size_t first_index;       // Zero-based sequence range [first, end).
+        uint64_t first_object_index;
+        size_t end_index;
+    };
+
+    const SegmentStore& store_;
     uint64_t term_;
     uint64_t leader_id_;
     uint64_t worker_id_;
@@ -356,37 +385,104 @@ private:
     std::condition_variable progress_cv_;
     bool stopping_{false};                  // Requests channel thread exit.
     uint64_t generation_{0};                // Increments once per published batch.
-    std::vector<ReplicationEntry> history_; // Immutable replay source per worker.
+    size_t published_sequence_{0};          // Independent of replay metadata size.
+    std::vector<ReplaySegment> replay_segments_; // Sorted contiguous sequence ranges.
+    uint64_t range_layout_{0};
     std::vector<std::unique_ptr<Channel>> channels_;
 
 
     NetMessage make_batch(size_t first_index, size_t end_index) {
+        std::lock_guard<std::mutex> storage_lock(store_.data_mutex);
         std::lock_guard<std::mutex> lock(mutex_);
+        refresh_ranges_locked();
         NetMessage batch;
         batch.type = MsgType::PUT_REPL_BATCH;
         batch.term = term_;
         batch.sender_id = leader_id_;
         batch.worker_id = worker_id_;
-        if (first_index >= end_index || end_index > history_.size()) {
+        batch.layout_version = store_.layout_version.load();
+        if (first_index >= end_index || end_index > published_sequence_) {
             return batch;
         }
-        batch.seq = history_[first_index].sequence;
+        batch.seq = static_cast<uint64_t>(first_index) + 1;
+        batch.entries.reserve(std::min(end_index - first_index,
+                                       kReplicationBatchEntryLimit));
+        // Find the first range once, then walk forward across segment boundaries.
+        auto range = std::lower_bound(
+            replay_segments_.begin(), replay_segments_.end(), first_index,
+            [](const ReplaySegment& segment, size_t index) {
+                return segment.end_index <= index;
+            });
         size_t bytes = 0;
+
         for (size_t index = first_index;
              index < end_index &&
              batch.entries.size() < kReplicationBatchEntryLimit;
              ++index) {
-            const ReplicationEntry& entry = history_[index];
-            const size_t entry_bytes =
-                entry.key.size() + entry.value.size() + 6U * sizeof(uint64_t);
+            if (range != replay_segments_.end() && index == range->end_index) ++range;
+            if (range == replay_segments_.end() || index < range->first_index) {
+                throw std::runtime_error("missing replication segment range");
+            }
+            const Segment& segment = *store_.segments[range->segment_index];
+            const uint64_t object_index = range->first_object_index + (index - range->first_index);
+            if (segment.meta.seg_ver.load(std::memory_order_acquire) != range->segment_version ||
+                object_index >= segment.meta.tail_idx.load(std::memory_order_acquire)) {
+                throw std::runtime_error("replication segment is no longer available");
+            }
+            const ObjectEntry& object = segment.entries[object_index];
+            if (object.term_id != term_ || object.seq_num != index + 1) {
+                throw std::runtime_error("replication segment sequence mismatch");
+            }
+            const size_t entry_bytes = std::strlen(object.key) + object.value.size() + 6U * sizeof(uint64_t);
             if (!batch.entries.empty() &&
                 bytes + entry_bytes > kReplicationBatchByteLimit) {
                 break;
             }
-            batch.entries.push_back(entry);
+
+            ReplicationEntry entry;
+            entry.sequence = object.seq_num;
+            entry.incarnation = object.incarnation;
+            entry.segment_index = range->segment_index;
+            entry.object_index = object_index;
+            entry.key = object.key;
+            entry.value = object.value;
+            entry.segment_term = segment.meta.term_id.load();
+            entry.segment_version = segment.meta.seg_ver.load();
+            batch.entries.push_back(std::move(entry));
             bytes += entry_bytes;
         }
         return batch;
+    }
+
+    // Rebuild bounded offset metadata only after relocation, not per PUT.
+    // Missing old sequences are intentional: those followers need state transfer.
+    void refresh_ranges_locked() {
+        const uint64_t layout = store_.layout_version.load();
+        if (range_layout_ == layout) return;
+        replay_segments_.clear();
+
+        for (const Segment* segment : store_.segments) {
+            if (segment->meta.owner_id.load() != worker_id_) continue;
+
+            for (uint64_t offset = 0; offset < segment->meta.tail_idx.load(); ++offset) {
+                const ObjectEntry& object = segment->entries[offset];
+                if (object.term_id != term_ || !object.seq_num || object.seq_num > published_sequence_) continue;
+                replay_segments_.push_back({segment->seg_index, segment->meta.seg_ver.load(),
+                    static_cast<size_t>(object.seq_num - 1), offset, static_cast<size_t>(object.seq_num)});
+            }
+        }
+        std::sort(replay_segments_.begin(), replay_segments_.end(),
+            [](const ReplaySegment& a, const ReplaySegment& b) { return a.first_index < b.first_index; });
+        std::vector<ReplaySegment> ranges;
+        for (const auto& range : replay_segments_) {
+            if (!ranges.empty() && ranges.back().segment_index == range.segment_index &&
+                ranges.back().end_index == range.first_index &&
+                ranges.back().first_object_index + ranges.back().end_index - ranges.back().first_index == range.first_object_index) {
+                ranges.back().end_index = range.end_index;
+            } else ranges.push_back(range);
+        }
+        replay_segments_.swap(ranges);
+        range_layout_ = layout;
     }
 
     // Each follower advances independently. Failed channels retry on the
@@ -403,11 +499,12 @@ private:
                 });
                 if (stopping_) return;
                 if (generation_ == 0 ||
-                    channel.prefix >= history_.size()) {
+                    (channel.prefix >= published_sequence_ &&
+                     channel.layout_version == store_.layout_version.load())) {
                     continue;
                 }
                 generation = generation_;
-                target_sequence = history_.size();
+                target_sequence = published_sequence_;
             }
 
             bool replicated = false;
@@ -416,7 +513,7 @@ private:
                     term_, leader_id_, worker_id_, target_sequence,
                     [this](size_t first, size_t last) {
                         return make_batch(first, last);
-                    });
+                    }, store_);
             } catch (...) {
                 channel.session.disconnect();
             }
@@ -429,6 +526,7 @@ private:
                 std::lock_guard<std::mutex> lock(mutex_);
                 prior_prefix = channel.prefix;
                 channel.prefix = channel.session.highest_acked;
+                channel.layout_version = channel.session.layout_version;
                 current_prefix = channel.prefix;
                 channel.completed_generation = generation;
                 report_failure = !replicated && !channel.failure_active;
@@ -946,6 +1044,7 @@ struct Replica {
                 std::unique_lock<std::shared_mutex> epoch_lock(replication_epoch_mutex);
                 RecoveryCoordinator coordinator(rs, store, ht, peer_endpoints, workers.size());
                 coordinator.recover_elected(term);
+                std::lock_guard<std::mutex> data_lock(store.data_mutex);
                 reconstruct_worker_progress_locked();
             });
             while (recovery.wait_for(kHeartbeatInterval) != std::future_status::ready &&
@@ -1140,6 +1239,12 @@ struct Replica {
             case MsgType::PREFIX_QUERY:
                 handle_prefix_query(sock, msg);
                 break;
+            case MsgType::SEGMENT_OWN_REQUEST:
+                handle_segment_ownership(sock, msg);
+                break;
+            case MsgType::STATE_BEGIN:
+                handle_segment_state(sock, msg);
+                break;
             case MsgType::RECOVERY_SUMMARY_REQUEST:
                 handle_recovery_summary(sock, msg);
                 break;
@@ -1229,6 +1334,95 @@ struct Replica {
         send_message(sock, reply);
     }
 
+    // Ownership is serialized across workers, unlike object replication. The
+    // epoch barrier excludes append/recovery; the election lock prevents a vote
+    // or heartbeat from changing leadership between validation and installation.
+    // This is one follower's acceptance, NOT proof of a majority commit.
+    void handle_segment_ownership(int sock, const NetMessage& msg) {
+        if (msg.type != MsgType::SEGMENT_OWN_REQUEST ||
+            !message_detail::valid_shape(msg)) {
+            NetMessage invalid;
+            invalid.status = OperationStatus::INVALID_REQUEST;
+            send_message(sock, invalid);
+            return;
+        }
+
+        NetMessage reply;
+        reply.type = MsgType::SEGMENT_OWN_REPLY;
+        reply.sender_id = rs.replica_id;
+        reply.worker_id = msg.worker_id;
+        reply.segment_index = msg.segment_index;
+        reply.segment_term = msg.segment_term;
+        reply.segment_version = msg.segment_version;
+        {
+            std::unique_lock<std::shared_mutex> epoch_lock(replication_epoch_mutex);
+            std::lock_guard<std::mutex> election_lock(rs.election_mutex);
+            reply.term = rs.current_term.load(std::memory_order_acquire);
+            reply.status = accept_segment_ownership_locked(msg);
+        }
+        // Network I/O must not hold the election or storage barrier.
+        DISKEYV_DEBUG("SEGMENT", "replica=" << rs.replica_id
+                         << " ownership=" << status_name(reply.status)
+                         << " segment=" << msg.segment_index
+                         << " worker=" << msg.worker_id
+                         << " term=" << msg.segment_term
+                         << " version=" << msg.segment_version);
+        send_message(sock, reply);
+    }
+
+    // Requires exclusive replication_epoch_mutex and rs.election_mutex.
+    OperationStatus accept_segment_ownership_locked(const NetMessage& msg) {
+        if (stop.load(std::memory_order_acquire)) return OperationStatus::SHUTTING_DOWN;
+        if (rs.role.load(std::memory_order_acquire) != Role::FOLLOWER ||
+            msg.term != rs.current_term.load(std::memory_order_acquire) ||
+            msg.sender_id == rs.replica_id ||
+            msg.sender_id == ReplicaState::kNoReplicaId ||
+            (election_enabled &&
+             msg.sender_id != rs.leader_id.load(std::memory_order_acquire)) ||
+            (!election_enabled && recovery_leader_id != 0 &&
+             msg.sender_id != recovery_leader_id)) {
+            return OperationStatus::NOT_LEADER;
+        }
+        if (msg.segment_index >= store.segments.size()) {
+            return OperationStatus::INVALID_REQUEST;
+        }
+        Segment& segment = *store.segments[msg.segment_index];
+        const uint8_t status = segment.meta.status.load(std::memory_order_acquire);
+        if (status != static_cast<uint8_t>(SegmentStatus::FREE)) {
+
+            const bool identical =
+                (status == static_cast<uint8_t>(SegmentStatus::ACTIVE) ||
+                 status == static_cast<uint8_t>(SegmentStatus::SEALED)) &&
+                segment.meta.owner_id.load(std::memory_order_acquire) == msg.worker_id &&
+                segment.meta.term_id.load(std::memory_order_acquire) == msg.segment_term &&
+                segment.meta.seg_ver.load(std::memory_order_acquire) == msg.segment_version;
+            return identical ? OperationStatus::OK : OperationStatus::STORAGE_ERROR;
+        }
+
+        // Do not infer permission to erase old objects from a newer version.
+        // Only an already empty, locally released segment can be allocated.
+        if (segment.meta.owner_id.load(std::memory_order_acquire) != UINT64_MAX ||
+            segment.meta.tail_idx.load(std::memory_order_acquire) != 0) {
+            return OperationStatus::STORAGE_ERROR;
+        }
+        const uint64_t previous = store.global_seg_ver.load(std::memory_order_acquire);
+        if (previous == std::numeric_limits<uint64_t>::max() ||
+            msg.segment_version != previous + 1) {
+            return OperationStatus::OUT_OF_ORDER;
+        }
+
+        // Preserve the leader's allocation identity instead of assigning an
+        // unrelated follower-local version. Publish ACTIVE after all metadata.
+        segment.meta.owner_id.store(msg.worker_id, std::memory_order_relaxed);
+        segment.meta.term_id.store(msg.segment_term, std::memory_order_relaxed);
+        segment.meta.seg_ver.store(msg.segment_version, std::memory_order_relaxed);
+        segment.meta.committed.store(false, std::memory_order_relaxed);
+        store.global_seg_ver.store(msg.segment_version, std::memory_order_release);
+        segment.meta.status.store(static_cast<uint8_t>(SegmentStatus::ACTIVE),
+                                  std::memory_order_release);
+        return OperationStatus::OK;
+    }
+
     void handle_replication(int sock, const NetMessage& msg) {
         std::shared_lock<std::shared_mutex> epoch_lock(
             replication_epoch_mutex);
@@ -1256,6 +1450,12 @@ struct Replica {
 
         const auto progress = progress_for(msg.worker_id);
         std::lock_guard<std::mutex> lock(progress->mutex);
+        std::lock_guard<std::mutex> data_lock(store.data_mutex);
+        if (msg.layout_version != store.layout_version.load()) {
+            reply.status = OperationStatus::OUT_OF_ORDER;
+            send_message(sock, reply);
+            return;
+        }
         reply.status = apply_replication_record(msg, *progress);
         reply.seq = progress->highest_contiguous_sequence;
         if (reply.status != OperationStatus::OK) {
@@ -1309,6 +1509,12 @@ struct Replica {
 
         const auto progress = progress_for(msg.worker_id);
         std::lock_guard<std::mutex> lock(progress->mutex);
+        std::lock_guard<std::mutex> data_lock(store.data_mutex);
+        if (msg.layout_version != store.layout_version.load()) {
+            reply.status = OperationStatus::OUT_OF_ORDER;
+            send_message(sock, reply);
+            return;
+        }
         reply.status = OperationStatus::OK;
         // Wire validation checks this too, but the handler preserves the
         // follower invariant even if it is called directly by a test/tool.
@@ -1328,6 +1534,8 @@ struct Replica {
             record.object_index = entry.object_index;
             record.key = entry.key;
             record.value = entry.value;
+            record.segment_term = entry.segment_term;
+            record.segment_version = entry.segment_version;
             reply.status = apply_replication_record(record, *progress);
             if (reply.status != OperationStatus::OK) break;
             ++expected;
@@ -1360,6 +1568,7 @@ struct Replica {
         reply.type = MsgType::PREFIX_REPLY;
         reply.term = msg.term;
         reply.worker_id = msg.worker_id;
+        reply.layout_version = store.layout_version.load();
         if (rs.role.load(std::memory_order_acquire) != Role::FOLLOWER ||
             msg.term != rs.current_term.load(std::memory_order_acquire) ||
             (election_enabled &&
@@ -1379,14 +1588,95 @@ struct Replica {
         reply.seq = progress->term == msg.term
                         ? progress->highest_contiguous_sequence
                         : 0;
-        reply.status = progress->term <= msg.term
+        reply.status = msg.layout_version != reply.layout_version
+                           ? OperationStatus::OUT_OF_ORDER
+                           : progress->term <= msg.term
                            ? OperationStatus::OK
                            : OperationStatus::INVALID_REQUEST;
         send_message(sock, reply);
     }
 
+    void handle_segment_state(int sock, const NetMessage& begin) {
+        std::unique_lock<std::shared_mutex> epoch_lock(replication_epoch_mutex);
+        std::lock_guard<std::mutex> data_lock(store.data_mutex);
+        auto authorized = [&] {
+            return !stop.load() && rs.role.load() == Role::FOLLOWER &&
+                begin.term == rs.current_term.load() && begin.sender_id != rs.replica_id &&
+                (election_enabled ? begin.sender_id == rs.leader_id.load() :
+                 (!recovery_leader_id || begin.sender_id == recovery_leader_id));
+        };
+        NetMessage reply;
+        reply.type = MsgType::ACK;
+        reply.term = rs.current_term.load();
+        if (!authorized() || store.segments.empty()) {
+            reply.status = OperationStatus::NOT_LEADER;
+            send_message(sock, reply);
+            return;
+        }
+        struct TimeoutGuard {
+            int socket;
+            timeval previous{};
+            timeval previous_send{};
+            explicit TimeoutGuard(int fd) : socket(fd) {
+                socklen_t length = sizeof(previous);
+                getsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, &previous, &length);
+                length = sizeof(previous_send);
+                getsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, &previous_send, &length);
+                timeval timeout{};
+                timeout.tv_sec = 2;
+                setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+                setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+            }
+            ~TimeoutGuard() {
+                setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, &previous, sizeof(previous));
+                setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, &previous_send, sizeof(previous_send));
+            }
+        } timeout(sock);
+        if (!send_message(sock, reply)) return;
+        SegmentState staged;
+        const size_t max_records = store.segments.size() * store.segments.front()->capacity;
+        while (true) {
+            NetMessage part;
+            if (!recv_message(sock, part)) return;
+            if (part.term != begin.term || part.sender_id != begin.sender_id || !authorized()) {
+                reply.status = OperationStatus::NOT_LEADER;
+            } else if (part.type == MsgType::STATE_BATCH &&
+                       part.entries.size() <= max_records - staged.records.size()) {
+                staged.records.insert(staged.records.end(),
+                    std::make_move_iterator(part.entries.begin()), std::make_move_iterator(part.entries.end()));
+            } else if (part.type == MsgType::STATE_END && part.seq == staged.records.size()) {
+                staged.layout = part.layout_version;
+                staged.allocation_version = part.last_segment_version;
+                staged.progress = part.worker_progress;
+                std::lock_guard<std::mutex> election_lock(rs.election_mutex);
+                
+                const bool valid_terms = std::all_of(staged.progress.begin(), staged.progress.end(),
+                    [&](const auto& prefix) { return prefix.term <= begin.term; }) &&
+                    std::all_of(staged.records.begin(), staged.records.end(), [&](const auto& entry) {
+                        return entry.term <= begin.term && entry.segment_term <= begin.term;
+                    });
+                if (!authorized() || !valid_terms || !staged.install(store, ht)) {
+                    reply.status = OperationStatus::STORAGE_ERROR;
+                } else {
+                    reconstruct_worker_progress_locked();
+                    recovering.store(false, std::memory_order_release);
+                    DISKEYV_INFO("GC", "replica=" << rs.replica_id << " state=installed layout="
+                        << staged.layout << " records=" << staged.records.size());
+                }
+                
+                send_message(sock, reply);
+                
+                return;
+            } else {
+                reply.status = OperationStatus::INVALID_REQUEST;
+            }
+            if (!send_message(sock, reply) || reply.status != OperationStatus::OK) return;
+        }
+    }
+
     void handle_recovery_summary(int sock, const NetMessage& msg) {
         std::unique_lock<std::shared_mutex> epoch_lock(replication_epoch_mutex);
+        std::lock_guard<std::mutex> data_lock(store.data_mutex);
         NetMessage reply;
         reply.type = MsgType::RECOVERY_SUMMARY_REPLY;
         reply.term = rs.current_term.load(std::memory_order_acquire);
@@ -1403,6 +1693,8 @@ struct Replica {
             reply.status = OperationStatus::INVALID_REQUEST;
         } else {
             reply.worker_progress = reconstruct_worker_progress_locked();
+            reply.layout_version = store.layout_version.load();
+            reply.last_segment_version = store.global_seg_ver.load();
             reply.status = OperationStatus::OK;
         }
         send_message(sock, reply);
@@ -1479,6 +1771,8 @@ struct Replica {
             entry.value = object.value;
             entry.term = object.term_id;
             entry.worker_id = msg.worker_id;
+            entry.segment_term = segment.meta.term_id.load();
+            entry.segment_version = segment.meta.seg_ver.load();
             const size_t entry_bytes = entry.key.size() + entry.value.size() + 8U * sizeof(uint64_t);
             if (!reply.entries.empty() &&
                 reply_bytes + entry_bytes > kMaxWireRecoveryBatchBytes) {
@@ -1498,6 +1792,7 @@ struct Replica {
         std::unique_lock<std::shared_mutex> epoch_lock(
             replication_epoch_mutex
         );
+        std::lock_guard<std::mutex> data_lock(store.data_mutex);
         NetMessage reply;
         reply.type = MsgType::ACK;
         reply.term = rs.current_term.load(std::memory_order_acquire);
@@ -1616,7 +1911,16 @@ struct Replica {
         }
 
         std::vector<WorkerProgressWire> result;
+        // GC keeps only numerical high-water marks, not overwritten payloads.
+        // They certify that sparse retained objects are a complete local state.
+        if (store.layout_version.load() != 0) {
+            for (size_t worker = 0; worker < store.progress.size(); ++worker) {
+                const auto& prefix = store.progress[worker];
+                if (prefix.first) result.push_back({worker, prefix.first, prefix.second});
+            }
+        }
         for (const auto& worker : sequences) {
+            if (store.layout_version.load() != 0) break;
             WorkerProgressWire latest;
             latest.worker_id = worker.first;
             for (const auto& term : worker.second) {
@@ -1633,7 +1937,10 @@ struct Replica {
                     latest.sequence = contiguous;
                 }
             }
-            if (latest.sequence > 0) result.push_back(latest);
+            if (latest.sequence > 0) {
+                result.push_back(latest);
+                store.progress[latest.worker_id] = {latest.term, latest.sequence};
+            }
         }
 
         std::lock_guard<std::mutex> map_lock(follower_progress_mutex);
@@ -1702,12 +2009,13 @@ struct Replica {
         const bool stored = PutPath::put_replicated_at(
             store, msg.worker_id, static_cast<size_t>(msg.segment_index),
             msg.object_index, msg.key, msg.value, msg.term, msg.seq,
-            msg.incarnation, record);
+            msg.incarnation, record, false, msg.segment_term, msg.segment_version);
         if (!stored) return OperationStatus::STORAGE_ERROR;
 
         ht.apply(store, record.seg_idx, record.obj_idx);
         progress.term = msg.term;
         progress.highest_contiguous_sequence = msg.seq;
+        store.progress[msg.worker_id] = {msg.term, msg.seq};
         return OperationStatus::OK;
     }
 
@@ -1764,6 +2072,26 @@ struct Replica {
         }
     }
 
+    // Opportunistic GC runs only under pressure; ordinary writes keep their
+    // existing shared epoch and parallel quorum path. A busy collector is
+    // skipped instead of making every worker queue behind it.
+    size_t collect_garbage(bool force = false) {
+        size_t free = 0;
+        
+        for (const Segment* segment : store.segments) {
+            if (segment->meta.status.load() == static_cast<uint8_t>(SegmentStatus::FREE)) ++free;
+        }
+
+        if (!force && free > std::max<size_t>(1, store.segments.size() / 4)) return 0;
+        std::unique_lock<std::shared_mutex> epoch_lock(replication_epoch_mutex, std::defer_lock);
+        if (force || free == 0) epoch_lock.lock();
+        else if (!epoch_lock.try_lock()) return 0;
+        if (recovering.load() || rs.role.load() != Role::LEADER) return 0;
+        std::lock_guard<std::mutex> data_lock(store.data_mutex);
+        
+        return collect_segments(store, ht);
+    }
+
     // Consume bounded client batches, append immutable records locally,
     // replicate them in parallel, and publish only the quorum-covered prefix.
     void worker_loop(Worker& worker) {
@@ -1814,6 +2142,9 @@ struct Replica {
                 }
             };
 
+            // Reclaim before entering the shared write epoch; GC never waits
+            // for quorum while holding its exclusive reader/replay barrier.
+            collect_garbage();
             // Recovery takes the exclusive side of this barrier. Holding it
             // through publication also drains old-term requests before import.
             std::shared_lock<std::shared_mutex> epoch_lock(replication_epoch_mutex);
@@ -1833,6 +2164,8 @@ struct Replica {
                 const uint64_t active =
                     worker.active_segment.load(std::memory_order_acquire);
                 if (active != UINT64_MAX && active < store.segments.size() &&
+                    store.segments[active]->meta.owner_id.load() == worker.worker_id &&
+                    store.segments[active]->meta.term_id.load() == worker_term &&
                     store.segments[active]->meta.status.load(
                         std::memory_order_acquire) ==
                         static_cast<uint8_t>(SegmentStatus::ACTIVE)) {
@@ -1845,7 +2178,7 @@ struct Replica {
                 produced_sequence = 0;
                 replication = std::make_unique<ParallelReplicationGroup>(
                     observed_term, rs.replica_id, worker.worker_id,
-                    peer_endpoints);
+                    peer_endpoints, store);
                 worker_term = observed_term;
             }
 
@@ -1866,6 +2199,7 @@ struct Replica {
                 uint64_t sequence;
             };
             std::vector<PreparedPut> prepared;
+            std::unique_lock<std::mutex> storage_lock(store.data_mutex);
             prepared.reserve(requests.size());
             for (Request& request : requests) {
                 ApplyRecord record{};
@@ -1893,6 +2227,8 @@ struct Replica {
                     continue;
                 }
                 produced_sequence = sequence;
+                ++store.pending[record.seg_idx];
+                store.progress[worker.worker_id] = {worker_term, sequence};
                 pending.push_back(record);
                 prepared.push_back(
                     PreparedPut{std::move(request), record, sequence});
@@ -1907,8 +2243,8 @@ struct Replica {
             for (const PreparedPut& put : prepared) {
                 replication_records.push_back(put.record);
             }
-            const ParallelReplicationGroup::Ticket ticket =
-                replication->publish(replication_records, store);
+            const ParallelReplicationGroup::Ticket ticket = replication->publish(replication_records);
+            storage_lock.unlock();
             election_lock.unlock();
             const uint64_t commit_watermark =
                 replication->wait_for_commit(ticket, quorum);
@@ -1925,6 +2261,7 @@ struct Replica {
                 continue;
             }
             std::unordered_map<uint64_t, IndexApplyResult> publications;
+            storage_lock.lock();
 
             // pending can contain earlier locally appended records that did
             // not reach quorum. A later cumulative watermark may publish them.
@@ -1936,8 +2273,10 @@ struct Replica {
                 const IndexApplyResult publication =
                     ht.apply(store, candidate.seg_idx, candidate.obj_idx);
                 publications.emplace(entry.seq_num, publication);
+                --store.pending[candidate.seg_idx];
                 pending.pop_front();
             }
+            storage_lock.unlock();
 
             for (PreparedPut& put : prepared) {
                 OperationStatus result = OperationStatus::NO_QUORUM;
@@ -2001,6 +2340,14 @@ struct Replica {
     }
 
     ObjectEntry* get(const std::string& key) { return ht.get(store, key); }
+
+    bool get_copy(const std::string& key, ObjectEntry& result) {
+        std::shared_lock<std::shared_mutex> epoch_lock(replication_epoch_mutex);
+        const ObjectEntry* object = ht.get(store, key);
+        if (!object) return false;
+        result = *object;
+        return true;
+    }
 
     int listening_port() const {
         sockaddr_in address{};

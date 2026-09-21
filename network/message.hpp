@@ -35,7 +35,12 @@ enum class MsgType : uint8_t {
     VOTE_REQUEST = 21,
     VOTE_REPLY = 22,
     PRE_VOTE_REQUEST = 23,
-    PRE_VOTE_REPLY = 24
+    PRE_VOTE_REPLY = 24,
+    SEGMENT_OWN_REQUEST = 25,
+    SEGMENT_OWN_REPLY = 26,
+    STATE_BEGIN = 27,
+    STATE_BATCH = 28,
+    STATE_END = 29
 };
 
 enum class OperationStatus : uint8_t {
@@ -78,6 +83,8 @@ struct ReplicationEntry {
     std::vector<uint8_t> value;
     uint64_t term{0};           // Included by recovery records.
     uint64_t worker_id{0};      // Included by recovery records.
+    uint64_t segment_term{0};
+    uint64_t segment_version{0};
 };
 
 struct WorkerProgressWire {
@@ -105,10 +112,13 @@ struct NetMessage {
     std::vector<uint8_t> value;
     std::vector<ReplicationEntry> entries;
     std::vector<WorkerProgressWire> worker_progress;
+    uint64_t segment_term{0};    // Also used by single-record replication.
+    uint64_t segment_version{0};
+    uint64_t layout_version{0}; // Fences batches using pre-GC offsets.
 };
 
 constexpr uint32_t kProtocolMagic = 0x444b5633U;
-constexpr uint16_t kProtocolVersion = 5;         // Reject incompatible peers.
+constexpr uint16_t kProtocolVersion = 7;         // GC layout fencing/state transfer.
 constexpr uint32_t kMaxWireKeySize = 63;
 constexpr uint32_t kMaxWireValueSize = 1024U * 1024U;
 constexpr uint32_t kMaxWireBatchEntries = 16;
@@ -132,7 +142,7 @@ inline uint64_t network_to_host_u64(uint64_t value) {
 
 inline bool valid_message_type(uint8_t type) {
     return type >= static_cast<uint8_t>(MsgType::PUT_REPL) &&
-           type <= static_cast<uint8_t>(MsgType::PRE_VOTE_REPLY);
+           type <= static_cast<uint8_t>(MsgType::STATE_END);
 }
 
 namespace message_detail {
@@ -199,10 +209,18 @@ inline bool read_blob(const std::vector<uint8_t>& bytes, size_t& cursor,
     return true;
 }
 
+// Both zero means unspecified while senders are being migrated. It is NOT
+// evidence that a segment may be retired or reused. A partial identity cannot
+// be interpreted safely and is rejected at the wire boundary.
+inline bool valid_segment_identity(uint64_t term, uint64_t version) {
+    return (term == 0) == (version == 0);
+}
+
 inline bool valid_entry(const ReplicationEntry& entry) {
     return entry.sequence > 0 && !entry.key.empty() &&
            entry.key.size() <= kMaxWireKeySize &&
-           entry.value.size() <= kMaxWireValueSize;
+           entry.value.size() <= kMaxWireValueSize &&
+           valid_segment_identity(entry.segment_term, entry.segment_version);
 }
 
 inline bool valid_recovery_entry(const ReplicationEntry& entry) {
@@ -217,8 +235,25 @@ inline bool valid_shape(const NetMessage& message) {
         static_cast<uint8_t>(message.status) >
             static_cast<uint8_t>(OperationStatus::RECOVERING) ||
         message.key.size() > kMaxWireKeySize ||
-        message.value.size() > kMaxWireValueSize) {
+        message.value.size() > kMaxWireValueSize ||
+        !valid_segment_identity(message.segment_term, message.segment_version)) {
         return false;
+    }
+    const bool ownership_request = message.type == MsgType::SEGMENT_OWN_REQUEST;
+    const bool ownership_reply = message.type == MsgType::SEGMENT_OWN_REPLY;
+    if (ownership_request || ownership_reply) {
+        return message.term > 0 && message.sender_id > 0 &&
+               message.worker_id < kMaxWireWorkerProgress &&
+               message.segment_index < std::numeric_limits<uint32_t>::max() &&
+               message.segment_term > 0 && message.segment_version > 0 &&
+               (!ownership_request || message.status == OperationStatus::OK) &&
+               ((!ownership_request && message.status != OperationStatus::OK) ||
+                message.segment_term <= message.term) &&
+               message.seq == 0 && message.incarnation == 0 &&
+               message.object_index == 0 && message.key.empty() &&
+               message.value.empty() && message.entries.empty() &&
+               message.worker_progress.empty() &&
+               message.last_segment_term == 0 && message.last_segment_version == 0;
     }
     const bool election_message = message.type == MsgType::HEARTBEAT ||
                                   message.type == MsgType::HEARTBEAT_REPLY ||
@@ -234,16 +269,17 @@ inline bool valid_shape(const NetMessage& message) {
     }
     const bool carries_recovery_entries =
         message.type == MsgType::RECOVERY_FETCH_REPLY ||
-        message.type == MsgType::RECOVERY_INSTALL_BATCH;
+        message.type == MsgType::RECOVERY_INSTALL_BATCH ||
+        message.type == MsgType::STATE_BATCH;
     const bool carries_entries =
         message.type == MsgType::PUT_REPL_BATCH || carries_recovery_entries;
     if (!carries_entries && !message.entries.empty()) return false;
-    if (message.type != MsgType::RECOVERY_SUMMARY_REPLY &&
+    if (message.type != MsgType::RECOVERY_SUMMARY_REPLY && message.type != MsgType::STATE_END &&
         !message.worker_progress.empty()) {
         return false;
     }
     if (message.worker_progress.size() > kMaxWireWorkerProgress) return false;
-    if (message.type == MsgType::RECOVERY_SUMMARY_REPLY) {
+    if (message.type == MsgType::RECOVERY_SUMMARY_REPLY || message.type == MsgType::STATE_END) {
         for (const WorkerProgressWire& progress : message.worker_progress) {
             if (progress.worker_id >= kMaxWireWorkerProgress ||
                 (progress.term == 0 && progress.sequence != 0)) {
@@ -266,7 +302,7 @@ inline bool valid_shape(const NetMessage& message) {
         return true;
     }
     if (message.entries.empty()) return false;
-    if (message.type == MsgType::RECOVERY_INSTALL_BATCH) {
+    if (message.type == MsgType::RECOVERY_INSTALL_BATCH || message.type == MsgType::STATE_BATCH) {
         for (const ReplicationEntry& entry : message.entries) {
             if (!valid_recovery_entry(entry)) return false;
         }
@@ -301,6 +337,9 @@ inline bool encode_payload(const NetMessage& message,
     append_u64(payload, message.sender_id);
     append_u64(payload, message.last_segment_term);
     append_u64(payload, message.last_segment_version);
+    append_u64(payload, message.segment_term);
+    append_u64(payload, message.segment_version);
+    append_u64(payload, message.layout_version);
     append_u32(payload, static_cast<uint32_t>(message.key.size()));
     append_u32(payload, static_cast<uint32_t>(message.value.size()));
     append_bytes(payload, message.key.data(), message.key.size());
@@ -317,6 +356,8 @@ inline bool encode_payload(const NetMessage& message,
         append_bytes(payload, entry.value.data(), entry.value.size());
         append_u64(payload, entry.term);
         append_u64(payload, entry.worker_id);
+        append_u64(payload, entry.segment_term);
+        append_u64(payload, entry.segment_version);
         if (payload.size() > kMaxWireFrameSize) return false;
     }
     append_u32(payload,
@@ -347,6 +388,9 @@ inline bool decode_payload(const std::vector<uint8_t>& payload,
         !read_u64(payload, cursor, message.sender_id) ||
         !read_u64(payload, cursor, message.last_segment_term) ||
         !read_u64(payload, cursor, message.last_segment_version) ||
+        !read_u64(payload, cursor, message.segment_term) ||
+        !read_u64(payload, cursor, message.segment_version) ||
+        !read_u64(payload, cursor, message.layout_version) ||
         !read_u32(payload, cursor, key_size) ||
         !read_u32(payload, cursor, value_size) ||
         key_size > kMaxWireKeySize || value_size > kMaxWireValueSize ||
@@ -358,7 +402,8 @@ inline bool decode_payload(const std::vector<uint8_t>& payload,
 
     const bool recovery_entries =
         message.type == MsgType::RECOVERY_FETCH_REPLY ||
-        message.type == MsgType::RECOVERY_INSTALL_BATCH;
+        message.type == MsgType::RECOVERY_INSTALL_BATCH ||
+        message.type == MsgType::STATE_BATCH;
     const uint32_t entry_limit = recovery_entries
                                      ? kMaxWireRecoveryBatchEntries
                                      : kMaxWireBatchEntries;
@@ -378,7 +423,9 @@ inline bool decode_payload(const std::vector<uint8_t>& payload,
             !read_blob(payload, cursor, key_size, entry.key) ||
             !read_blob(payload, cursor, value_size, entry.value) ||
             !read_u64(payload, cursor, entry.term) ||
-            !read_u64(payload, cursor, entry.worker_id)) {
+            !read_u64(payload, cursor, entry.worker_id) ||
+            !read_u64(payload, cursor, entry.segment_term) ||
+            !read_u64(payload, cursor, entry.segment_version)) {
             return false;
         }
         message.entries.push_back(std::move(entry));

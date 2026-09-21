@@ -30,6 +30,11 @@ if(BUILD_TESTING)
     target_link_libraries(diskeyv-index-tests PRIVATE diskeyv_options)
     add_test(NAME diskeyv-index COMMAND diskeyv-index-tests)
     set_tests_properties(diskeyv-index PROPERTIES TIMEOUT 20)
+
+    add_executable(diskeyv-gc-tests tests/test_gc.cpp)
+    target_link_libraries(diskeyv-gc-tests PRIVATE diskeyv_options)
+    add_test(NAME diskeyv-gc COMMAND diskeyv-gc-tests)
+    set_tests_properties(diskeyv-gc PROPERTIES TIMEOUT 120)
 endif()
 
 option(DISKEYV_ENABLE_SANITIZERS "Enable address and undefined behavior sanitizers" OFF)

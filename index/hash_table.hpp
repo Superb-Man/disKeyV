@@ -92,6 +92,58 @@ public:
         return IndexApplyResult::FULL;
     }
 
+    // GC moves a live object without creating a new version. The caller must
+    // finish copying the object before calling this, and keep both locations
+    // stable throughout the call. Success changes only the index pointer;
+    // readers and replication/recovery may still require the old segment.
+    bool relocate(SegmentStore& store, size_t old_segment_index,
+                  uint64_t old_object_index, size_t new_segment_index,
+                  uint64_t new_object_index) {
+        OffsetType old_offset = kEmpty;
+        OffsetType new_offset = kEmpty;
+        if (!pack_offset(old_segment_index, old_object_index, old_offset) ||
+            !pack_offset(new_segment_index, new_object_index, new_offset) ||
+            old_offset == new_offset) {
+            return false;
+        }
+
+        const ObjectEntry* original = resolve(store, old_offset);
+        const ObjectEntry* moved = resolve(store, new_offset);
+        if (original == nullptr || moved == nullptr ||
+            !valid_key(*original) || !valid_key(*moved)) {
+            return false;
+        }
+        const std::string key(original->key);
+        if (!key_equals(*moved, key) ||
+            original->term_id != moved->term_id ||
+            original->seq_num != moved->seq_num ||
+            original->incarnation != moved->incarnation ||
+            original->value != moved->value) {
+            return false;
+        }
+
+        const size_t first_slot = std::hash<std::string>{}(key) % slots_.size();
+        for (size_t probe = 0; probe < slots_.size(); ++probe) {
+            std::atomic<OffsetType>& slot =
+                slots_[(first_slot + probe) % slots_.size()];
+            OffsetType current = slot.load(std::memory_order_acquire);
+            if (current == kEmpty) return false;
+            if (current == old_offset) {
+                // If a writer published a newer version while GC copied, leave
+                // that version untouched. A strong CAS needs no retry loop.
+                return slot.compare_exchange_strong(
+                    current, new_offset, std::memory_order_acq_rel,
+                    std::memory_order_acquire);
+            }
+            const ObjectEntry* existing = resolve(store, current);
+            if (existing == nullptr || !valid_key(*existing) ||
+                key_equals(*existing, key)) {
+                return false;
+            }
+        }
+        return false;
+    }
+
     // Follow the same linear-probing chain used by apply. An empty slot ends
     // the search because entries are never deleted from the current index.
     ObjectEntry* get(SegmentStore& store, const std::string& key) const {
@@ -110,6 +162,8 @@ public:
     }
 
     size_t capacity() const { return slots_.size(); }
+
+    void swap_contents(HashTable& other) { slots_.swap(other.slots_); }
 
 private:
     static constexpr OffsetType kEmpty = 0; // Reserved "no object" sentinel.

@@ -25,6 +25,7 @@
 #include "../network/socket_utils.hpp"
 #include "../replica/replica_state.hpp"
 #include "../storage/segment_store.hpp"
+#include "../storage/segment_gc.hpp"
 
 // Recovery selects a source independently for each worker because different
 // worker streams may have reached different replica majorities.
@@ -60,6 +61,9 @@ public:
 
 private:
     uint64_t recover_impl(uint64_t election_term) {
+        // The caller already excludes requests. Also drain old replay readers
+        // before replacing physical layouts during consolidation.
+        std::lock_guard<std::mutex> storage_lock(store_.data_mutex);
         elected_term_ = election_term;
         recovery_term_ = 0; // Initial summaries precede recovery authorization.
         peers_.clear();
@@ -94,6 +98,18 @@ private:
         // Different workers can have different freshest replicas, so source
         // selection is deliberately independent for every worker stream.
         const std::vector<SelectedPrefix> selected = select_worker_sources();
+
+        bool compacted = store_.layout_version.load() != 0;
+        for (const auto& peer : peers_) {
+            compacted = compacted || peer->layout_version != 0;
+        }
+
+        if (compacted) {
+            recover_compacted(selected);
+            if (elected_term_ == 0) replica_state_.current_term.store(recovery_term_);
+            check_elected_epoch();
+            return recovery_term_;
+        }
 
         std::vector<ReplicationEntry> canonical_records;
         for (uint64_t worker_id = 0; worker_id < worker_count_; ++worker_id) {
@@ -141,6 +157,12 @@ private:
         check_elected_epoch();
         rebuild_index(canonical_records);
         seal_recovered_segments();
+        std::fill(store_.pending.begin(), store_.pending.end(), 0);
+        for (size_t worker = 0; worker < selected.size(); ++worker) {
+            store_.progress[worker] = {
+                selected[worker].term, selected[worker].sequence
+            };
+        }
         if (elected_term_ == 0) {
             replica_state_.current_term.store(recovery_term_, std::memory_order_release);
         }
@@ -169,6 +191,8 @@ private:
         PeerEndpoint endpoint;
         int socket{-1}; // Reused across all recovery phases for this follower.
         uint64_t current_term{0}; // Term reported by its latest summary.
+        uint64_t layout_version{0};
+        uint64_t allocation_version{0};
         // worker_id -> latest contiguous progress advertised by the follower.
         std::map<uint64_t, WorkerProgressWire> progress;
     };
@@ -216,6 +240,14 @@ private:
     // Scan the survivor while its caller holds the local recovery barrier.
     // Segment ownership supplies the worker ID absent from ObjectEntry itself.
     void snapshot_local_history() {
+        if (store_.layout_version.load() != 0) {
+            const SegmentState state = SegmentState::capture(store_);
+            local_records_ = state.records;
+            for (const auto& prefix : state.progress) {
+                local_progress_[prefix.worker_id] = prefix;
+            }
+            return;
+        }
         std::map<uint64_t, std::map<uint64_t, std::set<uint64_t>>> sequences;
         for (const Segment* segment : store_.segments) {
             if (segment->meta.status.load(std::memory_order_acquire) ==
@@ -338,6 +370,8 @@ private:
                 "invalid recovery summary from " + peer.endpoint.identity());
         }
         peer.current_term = reply.term;
+        peer.layout_version = reply.layout_version;
+        peer.allocation_version = reply.last_segment_version;
         peer.progress.clear();
         for (const WorkerProgressWire& progress : reply.worker_progress) {
             if (progress.worker_id >= worker_count_ ||
@@ -410,6 +444,99 @@ private:
                 }
             }
         }
+    }
+
+    void recover_compacted(const std::vector<SelectedPrefix>& selected) {
+        std::vector<ReplicationEntry> objects = local_records_;
+        uint64_t layout = store_.layout_version.load();
+        uint64_t version = store_.global_seg_ver.load();
+
+        for (const auto& peer : peers_) {
+            layout = std::max(layout, peer->layout_version);
+            version = std::max(version, peer->allocation_version);
+
+            for (const auto& item : peer->progress) {
+                const auto& prefix = item.second;
+                if (!prefix.sequence) continue;
+                auto records = fetch_worker_history(*peer, prefix.worker_id, prefix.term, prefix.sequence);
+                objects.insert(objects.end(), std::make_move_iterator(records.begin()),
+                               std::make_move_iterator(records.end()));
+            }
+        }
+        std::map<std::string, ReplicationEntry> latest;
+        for (auto& object : objects) {
+            if (!message_detail::valid_recovery_entry(object) || object.worker_id >= worker_count_ ||
+                object.term >= recovery_term_) throw std::runtime_error("invalid compacted recovery object");
+            auto found = latest.find(object.key);
+            
+            if (found == latest.end()) latest.emplace(object.key, std::move(object));
+            else {
+                const auto left = std::tie(object.term, object.incarnation);
+                const auto right = std::tie(found->second.term, found->second.incarnation);
+                if (left == right && (object.value != found->second.value ||
+                    object.worker_id != found->second.worker_id || object.sequence != found->second.sequence)) {
+                    throw std::runtime_error("conflicting compacted recovery version");
+                }
+                if (left > right) found->second = std::move(object);
+            }
+        }
+        if (layout == UINT64_MAX || store_.segments.empty()) throw std::runtime_error("GC layout exhausted");
+        
+        SegmentState state;
+        
+        state.layout = layout + 1;
+        for (size_t worker = 0; worker < selected.size(); ++worker) {
+            if (selected[worker].term) {
+                state.progress.push_back({worker, selected[worker].term, selected[worker].sequence});
+            }
+        }
+        std::map<uint64_t, std::pair<size_t, uint64_t>> destinations;
+        std::vector<uint64_t> versions;
+        const uint64_t capacity = store_.segments.front()->capacity;
+
+
+        for (auto& item : latest) {
+            ReplicationEntry& entry = item.second;
+            auto target = destinations.find(entry.worker_id);
+            
+            if (target == destinations.end() || target->second.second == capacity) {
+                if (versions.size() == store_.segments.size() || version == UINT64_MAX) {
+                    throw std::runtime_error("live recovery state exceeds segment capacity");
+                }
+                target = destinations.insert_or_assign(entry.worker_id,
+                    std::make_pair(versions.size(), uint64_t{0})).first;
+                versions.push_back(++version);
+            }
+
+            entry.segment_index = target->second.first;
+            entry.object_index = target->second.second++;
+            entry.segment_term = recovery_term_;
+            entry.segment_version = versions[target->second.first];
+            state.records.push_back(std::move(entry));
+        }
+        // State installation requires contiguous physical offsets per segment.
+        std::sort(state.records.begin(), state.records.end(), [](const auto& a, const auto& b) {
+            return std::tie(a.segment_index, a.object_index) < std::tie(b.segment_index, b.object_index);
+        });
+        state.allocation_version = version;
+        
+        SegmentStore validation(store_.segments.size(), capacity);
+        HashTable validation_index(index_.capacity());
+        if (!state.install(validation, validation_index)) throw std::runtime_error("invalid recovered state");
+        for (const auto& peer : peers_) {
+            check_elected_epoch();
+            if (!transfer_segment_state(peer->socket, recovery_term_, replica_state_.replica_id,
+                    [&]() -> const SegmentState& { return state; })) {
+                throw std::runtime_error("failed compacted state repair: " + peer->endpoint.identity());
+            }
+        }
+        check_elected_epoch();
+        if (!state.install(store_, index_)) throw std::runtime_error("failed local compacted installation");
+        seal_recovered_segments();
+        refresh_stable_summaries();
+        verify_repaired_followers(selected);
+        DISKEYV_INFO("RECOVERY", "phase=compacted-state-installed records=" << state.records.size()
+                     << " layout=" << state.layout);
     }
 
 
