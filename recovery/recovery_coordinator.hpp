@@ -146,12 +146,23 @@ private:
         canonical_records.insert(canonical_records.end(),
                                  local_records_.begin(), local_records_.end());
         check_elected_epoch();
+        merge_ownerships();
         validate_and_import(canonical_records, selected);
         DISKEYV_INFO("RECOVERY",
                      "replica=" << replica_state_.replica_id
                                 << " phase=imported records="
                                 << canonical_records.size());
-        repair_followers(canonical_records);
+        for (size_t worker = 0; worker < selected.size(); ++worker)
+            store_.progress[worker] = {selected[worker].term, selected[worker].sequence};
+        // A full checkpoint also repairs empty owned segments. Record-only
+        // repair cannot preserve their allocation identities.
+        const SegmentState repaired = SegmentState::capture(store_);
+        for (const auto& peer : peers_) {
+            check_elected_epoch();
+            if (!transfer_segment_state(peer->socket, recovery_term_, replica_state_.replica_id,
+                    [&]() -> const SegmentState& { return repaired; }))
+                throw std::runtime_error("failed ownership/state repair: " + peer->endpoint.identity());
+        }
         refresh_stable_summaries();
         verify_repaired_followers(selected);
         check_elected_epoch();
@@ -193,6 +204,8 @@ private:
         uint64_t current_term{0}; // Term reported by its latest summary.
         uint64_t layout_version{0};
         uint64_t allocation_version{0};
+        uint64_t allocation_term{0};
+        std::vector<SegmentOwnershipWire> ownerships;
         // worker_id -> latest contiguous progress advertised by the follower.
         std::map<uint64_t, WorkerProgressWire> progress;
     };
@@ -273,6 +286,8 @@ private:
                 entry.object_index = offset;
                 entry.key = std::string(object.key);
                 entry.value = object.value;
+                entry.segment_term = segment->meta.term_id.load();
+                entry.segment_version = segment->meta.seg_ver.load();
                 local_records_.push_back(std::move(entry));
             }
         }
@@ -372,6 +387,8 @@ private:
         peer.current_term = reply.term;
         peer.layout_version = reply.layout_version;
         peer.allocation_version = reply.last_segment_version;
+        peer.allocation_term = reply.last_segment_term;
+        peer.ownerships = reply.ownerships;
         peer.progress.clear();
         for (const WorkerProgressWire& progress : reply.worker_progress) {
             if (progress.worker_id >= worker_count_ ||
@@ -519,6 +536,7 @@ private:
             return std::tie(a.segment_index, a.object_index) < std::tie(b.segment_index, b.object_index);
         });
         state.allocation_version = version;
+        state.allocation_term = recovery_term_;
         
         SegmentStore validation(store_.segments.size(), capacity);
         HashTable validation_index(index_.capacity());
@@ -579,6 +597,52 @@ private:
             if (reply.object_index == 1) break;
         }
         return records;
+    }
+
+    void merge_ownerships() {
+        std::map<uint64_t, SegmentOwnershipWire> union_by_segment;
+        std::map<uint64_t, uint64_t> version_slots;
+        auto include = [&](const std::vector<SegmentOwnershipWire>& ownerships) {
+            
+            for (const auto& ownership : ownerships) {
+                if (ownership.segment_index >= store_.segments.size() ||
+                    ownership.worker_id >= worker_count_ || ownership.term >= recovery_term_ ) {
+                    
+                    throw std::runtime_error("invalid recovery ownership");
+                }
+                auto found = union_by_segment.emplace(ownership.segment_index, ownership);
+                const auto& existing = found.first->second;
+                if (existing.worker_id != ownership.worker_id || existing.term != ownership.term ||
+                    existing.version != ownership.version) {
+
+                    throw std::runtime_error("conflicting recovery ownership");
+                }
+
+                auto version = version_slots.emplace(ownership.version, ownership.segment_index);
+                if (version.first->second != ownership.segment_index) {
+
+                    throw std::runtime_error("reused ownership version");
+                }
+            }
+        };
+
+        include(SegmentState::capture_ownerships(store_));
+
+        for (const auto& peer : peers_) {
+            include(peer->ownerships);
+            store_.global_seg_ver.store(std::max(store_.global_seg_ver.load(), peer->allocation_version));
+            store_.ownership_term.store(std::max(store_.ownership_term.load(), peer->allocation_term));
+        }
+
+        for (const auto& item : union_by_segment) {
+            const auto& ownership = item.second;
+            Segment& segment = *store_.segments[item.first];
+            if (segment.meta.status.load() == static_cast<uint8_t>(SegmentStatus::FREE) &&
+                !store_.try_acquire(segment, ownership.worker_id, ownership.term, ownership.version)) {
+                
+                throw std::runtime_error("cannot install recovery ownership");
+            }
+        }
     }
 
     static bool same_record(const ReplicationEntry& left,
@@ -673,7 +737,8 @@ private:
                     store_, entry.worker_id,
                     static_cast<size_t>(entry.segment_index),
                     entry.object_index, entry.key, entry.value, entry.term,
-                    entry.sequence, entry.incarnation, applied, true)) {
+                    entry.sequence, entry.incarnation, applied, true,
+                    entry.segment_term, entry.segment_version)) {
                 throw std::runtime_error("recovery could not reproduce a segment offset");
             }
         }
@@ -757,6 +822,8 @@ private:
 
     void seal_recovered_segments() {
         for (Segment* segment : store_.segments) {
+            if (segment->meta.status.load() != static_cast<uint8_t>(SegmentStatus::FREE))
+                segment->meta.committed.store(true);
             if (segment->meta.status.load(std::memory_order_acquire) ==
                 static_cast<uint8_t>(SegmentStatus::ACTIVE)) {
                 segment->seal();

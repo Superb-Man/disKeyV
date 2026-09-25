@@ -7,10 +7,12 @@
 #include <cstdlib>
 #include <array>
 #include <mutex>
+#include <algorithm>
 
 struct SegmentStore {
     std::vector<Segment*> segments;          // Fixed physical segment arena.
     std::atomic<uint64_t> global_seg_ver{0}; // Monotonic allocation generation.
+    std::atomic<uint64_t> ownership_term{0}; // Retained even after GC frees the newest segment.
     mutable std::mutex data_mutex;
     std::atomic<uint64_t> layout_version{0}; // Changes when physical offsets move.
     std::array<std::pair<uint64_t, uint64_t>, 64> progress{};
@@ -103,6 +105,8 @@ struct SegmentStore {
         seg.meta.seg_ver.store(version, std::memory_order_release);
 
         seg.meta.term_id.store(term, std::memory_order_release);
+        ownership_term.store(std::max(ownership_term.load(), term));
+        seg.meta.committed.store(false, std::memory_order_relaxed);
 
         seg.meta.tail_idx.store(0, std::memory_order_release);
         seg.meta.status.store((uint8_t)SegmentStatus::ACTIVE, std::memory_order_release);
@@ -135,6 +139,8 @@ struct SegmentStore {
 
             seg.meta.owner_id.store(wid, std::memory_order_release);
             seg.meta.term_id.store(term, std::memory_order_release);
+            ownership_term.store(std::max(ownership_term.load(), term));
+            seg.meta.committed.store(false, std::memory_order_relaxed);
             seg.meta.seg_ver.store(global_seg_ver.fetch_add(1) + 1, std::memory_order_release);
             seg.meta.tail_idx.store(0, std::memory_order_release);
 

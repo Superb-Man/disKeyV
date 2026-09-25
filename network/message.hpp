@@ -93,6 +93,15 @@ struct WorkerProgressWire {
     uint64_t sequence{0};  // Highest contiguous sequence in that term.
 };
 
+// Empty allocations must survive recovery too; records alone omit them.
+struct SegmentOwnershipWire {
+    uint64_t segment_index{0};
+    uint64_t worker_id{0};
+    uint64_t term{0};
+    uint64_t version{0};
+    uint64_t sealed{0};
+};
+
 
 struct NetMessage {
     MsgType type{MsgType::ACK};
@@ -115,16 +124,18 @@ struct NetMessage {
     uint64_t segment_term{0};    // Also used by single-record replication.
     uint64_t segment_version{0};
     uint64_t layout_version{0}; // Fences batches using pre-GC offsets.
+    std::vector<SegmentOwnershipWire> ownerships;
 };
 
 constexpr uint32_t kProtocolMagic = 0x444b5633U;
-constexpr uint16_t kProtocolVersion = 7;         // GC layout fencing/state transfer.
+constexpr uint16_t kProtocolVersion = 8;         // Ownership-preserving state/recovery.
 constexpr uint32_t kMaxWireKeySize = 63;
 constexpr uint32_t kMaxWireValueSize = 1024U * 1024U;
 constexpr uint32_t kMaxWireBatchEntries = 16;
 constexpr uint32_t kMaxWireRecoveryBatchEntries = 256;
 constexpr size_t kMaxWireRecoveryBatchBytes = 1024U * 1024U;
 constexpr uint32_t kMaxWireWorkerProgress = 64;
+constexpr uint32_t kMaxWireOwnerships = 4096;
 constexpr uint32_t kMaxWireFrameSize = 20U * 1024U * 1024U;
 
 inline uint64_t host_to_network_u64(uint64_t value) {
@@ -238,6 +249,14 @@ inline bool valid_shape(const NetMessage& message) {
         message.value.size() > kMaxWireValueSize ||
         !valid_segment_identity(message.segment_term, message.segment_version)) {
         return false;
+    }
+    if (message.ownerships.size() > kMaxWireOwnerships ||
+        (!message.ownerships.empty() && message.type != MsgType::STATE_END &&
+         message.type != MsgType::RECOVERY_SUMMARY_REPLY)) return false;
+    for (const auto& ownership : message.ownerships) {
+        if (!ownership.term || !ownership.version || ownership.sealed > 1 ||
+            ownership.worker_id >= kMaxWireWorkerProgress ||
+            ownership.segment_index >= std::numeric_limits<uint32_t>::max()) return false;
     }
     const bool ownership_request = message.type == MsgType::SEGMENT_OWN_REQUEST;
     const bool ownership_reply = message.type == MsgType::SEGMENT_OWN_REPLY;
@@ -367,6 +386,14 @@ inline bool encode_payload(const NetMessage& message,
         append_u64(payload, progress.term);
         append_u64(payload, progress.sequence);
     }
+    append_u32(payload, static_cast<uint32_t>(message.ownerships.size()));
+    for (const auto& ownership : message.ownerships) {
+        append_u64(payload, ownership.segment_index);
+        append_u64(payload, ownership.worker_id);
+        append_u64(payload, ownership.term);
+        append_u64(payload, ownership.version);
+        append_u64(payload, ownership.sealed);
+    }
     return payload.size() <= kMaxWireFrameSize;
 }
 
@@ -443,6 +470,18 @@ inline bool decode_payload(const std::vector<uint8_t>& payload,
             return false;
         }
         message.worker_progress.push_back(progress);
+    }
+    uint32_t ownership_count = 0;
+    if (!read_u32(payload, cursor, ownership_count) ||
+        ownership_count > kMaxWireOwnerships) return false;
+    for (uint32_t index = 0; index < ownership_count; ++index) {
+        SegmentOwnershipWire ownership;
+        if (!read_u64(payload, cursor, ownership.segment_index) ||
+            !read_u64(payload, cursor, ownership.worker_id) ||
+            !read_u64(payload, cursor, ownership.term) ||
+            !read_u64(payload, cursor, ownership.version) ||
+            !read_u64(payload, cursor, ownership.sealed)) return false;
+        message.ownerships.push_back(ownership);
     }
     return cursor == payload.size() && valid_shape(message);
 }

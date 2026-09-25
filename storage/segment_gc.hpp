@@ -7,11 +7,14 @@
 #include <memory>
 #include <set>
 #include <tuple>
+#include <functional>
 
 
 struct SegmentState {
     uint64_t layout{0};
     uint64_t allocation_version{0};
+    uint64_t allocation_term{0};
+    std::vector<SegmentOwnershipWire> ownerships;
     std::vector<ReplicationEntry> records;
     std::vector<WorkerProgressWire> progress;
 
@@ -20,6 +23,8 @@ struct SegmentState {
         SegmentState state;
         state.layout = store.layout_version.load();
         state.allocation_version = store.global_seg_ver.load();
+        state.allocation_term = store.ownership_term.load();
+        state.ownerships = capture_ownerships(store);
         for (size_t worker = 0; worker < store.progress.size(); ++worker) {
             const auto& prefix = store.progress[worker];
             if (prefix.first) state.progress.push_back({worker, prefix.first, prefix.second});
@@ -37,12 +42,41 @@ struct SegmentState {
         return state;
     }
 
+    static std::vector<SegmentOwnershipWire> capture_ownerships(const SegmentStore& store) {
+        std::vector<SegmentOwnershipWire> result;
+
+        for (const Segment* segment : store.segments) {
+            const auto status = static_cast<SegmentStatus>(segment->meta.status.load());
+            if (status == SegmentStatus::FREE) continue;
+            result.push_back({segment->seg_index, segment->meta.owner_id.load(),
+                segment->meta.term_id.load(), segment->meta.seg_ver.load(), status == SegmentStatus::SEALED ? 
+                                                                            uint64_t{1} : uint64_t{0}});
+        }
+        return result;
+    }
+
 
     bool install(SegmentStore& store, HashTable& index) const {
         if (store.segments.empty()) return false;
         SegmentStore staged(store.segments.size(), store.segments.front()->capacity);
 
         HashTable staged_index(index.capacity());
+        std::set<uint64_t> allocated_slots;
+        std::set<uint64_t> allocated_versions;
+        for (const auto& ownership : ownerships) {
+            if (ownership.segment_index >= staged.segments.size() ||
+                ownership.worker_id >= staged.progress.size() || !ownership.term ||
+                !ownership.version || ownership.version > allocation_version ||
+                ownership.sealed > 1 ||
+                !allocated_slots.insert(ownership.segment_index).second ||
+                !allocated_versions.insert(ownership.version).second ||
+                !staged.try_acquire(*staged.segments[ownership.segment_index],
+                    ownership.worker_id, ownership.term, ownership.version)) {
+                    
+                        return false;
+                    
+                }
+        }
         for (const auto& prefix : progress) {
             if (prefix.worker_id >= staged.progress.size() || !prefix.term ||
                 staged.progress[prefix.worker_id].first) return false;
@@ -58,6 +92,7 @@ struct SegmentState {
             if (std::make_pair(entry.term, entry.sequence) > prefix) return false;
             Segment& segment = *staged.segments[entry.segment_index];
             if (segment.meta.status.load() == static_cast<uint8_t>(SegmentStatus::FREE)) {
+                if (!ownerships.empty()) return false;
                 segment.meta.owner_id.store(entry.worker_id);
                 segment.meta.term_id.store(entry.segment_term);
                 segment.meta.seg_ver.store(entry.segment_version);
@@ -72,6 +107,9 @@ struct SegmentState {
                 !index_apply_succeeded(staged_index.apply(staged,
                     entry.segment_index, entry.object_index))) return false;
             if (segment.is_full()) segment.seal();
+        }
+        for (const auto& ownership : ownerships) {
+            if (ownership.sealed) staged.segments[ownership.segment_index]->seal();
         }
 
         for (size_t i = 0; i < store.segments.size(); ++i) {
@@ -89,7 +127,12 @@ struct SegmentState {
         store.progress = staged.progress;
         std::fill(store.pending.begin(), store.pending.end(), 0);
         store.global_seg_ver.store(allocation_version);
+
+        uint64_t term = allocation_term;
+        for (const Segment* segment : staged.segments) term = std::max(term, segment->meta.term_id.load());
+        store.ownership_term.store(term);
         store.layout_version.store(layout);
+        
         return true;
     }
 };
@@ -138,6 +181,8 @@ bool transfer_segment_state(int socket, uint64_t term, uint64_t leader,
     end.seq = state.records.size();
     end.layout_version = state.layout;
     end.last_segment_version = state.allocation_version;
+    end.last_segment_term = state.allocation_term;
+    end.ownerships = state.ownerships;
     end.worker_progress = state.progress;
     return send_message(socket, end) && recv_message(socket, reply) &&
            reply.type == MsgType::ACK && reply.term == term &&
@@ -145,8 +190,11 @@ bool transfer_segment_state(int socket, uint64_t term, uint64_t leader,
 }
 
 
-inline size_t collect_segments(SegmentStore& store, HashTable& index) {
+inline size_t collect_segments(SegmentStore& store, HashTable& index,
+                              const std::function<int64_t(uint64_t, uint64_t)>& allocate = {},
+                              uint64_t allocation_term = 0) {
     size_t released = 0;
+    bool allocation_failed = false;
     for (Segment* source : store.segments) {
         if (source->meta.status.load() != static_cast<uint8_t>(SegmentStatus::SEALED) ||
             store.pending[source->seg_index]) continue;
@@ -161,20 +209,26 @@ inline size_t collect_segments(SegmentStore& store, HashTable& index) {
         if (!live.empty() && live.size() * 2 > tail) continue;
         const uint64_t owner = source->meta.owner_id.load();
         const uint64_t term = source->meta.term_id.load();
+        const uint64_t destination_term = allocation_term ? allocation_term : term;
         Segment* destination = nullptr;
         
         if (!live.empty()) {
             for (Segment* candidate : store.segments) {
                 if (candidate != source && candidate->meta.status.load() == static_cast<uint8_t>(SegmentStatus::ACTIVE) &&
-                    candidate->meta.owner_id.load() == owner && candidate->meta.term_id.load() == term &&
+                    candidate->meta.owner_id.load() == owner && candidate->meta.term_id.load() == destination_term &&
+                    (!allocate || candidate->meta.committed.load()) &&
                     candidate->capacity - candidate->meta.tail_idx.load() >= live.size()) {
                     destination = candidate;
                     break;
                 }
             }
             if (!destination) {
-                const int64_t allocated = store.acquire_free_segment(owner, term);
-                if (allocated < 0) continue;
+                // One failed ownership round is enough for this pass. Still
+                // reclaim fully dead sources without repeating network waits.
+                if (allocate && allocation_failed) continue;
+                const int64_t allocated = allocate ? allocate(owner, destination_term)
+                                                  : store.acquire_free_segment(owner, destination_term);
+                if (allocated < 0) { allocation_failed = true; continue; }
                 destination = store.segments[static_cast<size_t>(allocated)];
             }
             for (uint64_t offset : live) {
@@ -185,10 +239,14 @@ inline size_t collect_segments(SegmentStore& store, HashTable& index) {
             }
             if (destination->is_full()) destination->seal();
         }
-        if (store.release_sealed_segment(source->seg_index, owner, term, source->meta.seg_ver.load())) ++released;
+        if (store.release_sealed_segment(source->seg_index, owner, term, source->meta.seg_ver.load())) {
+            ++released;
+            // A subsequent allocation may release data_mutex for its quorum
+            // round. Publish each completed layout change before that point.
+            store.layout_version.fetch_add(1);
+        }
     }
     if (released) {
-        store.layout_version.fetch_add(1);
         store.reclaimed_segments.fetch_add(released);
     }
     return released;

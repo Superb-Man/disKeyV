@@ -15,7 +15,7 @@ struct SegmentMetadata {
     std::atomic<uint64_t> seg_ver;   // Store-wide allocation generation.
     uint32_t object_size;            // Reserved for fixed-size layout metadata.
     std::atomic<uint64_t> tail_idx;  // First unreserved object position.
-    std::atomic<bool> committed{false};  // Reserved segment commit marker.
+    std::atomic<bool> committed{false};  // Local ownership-quorum confirmation, not object commit.
     
     SegmentMetadata()
         : owner_id(UINT64_MAX),

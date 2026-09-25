@@ -38,6 +38,7 @@
 #include "../recovery/recovery_coordinator.hpp"
 #include "../storage/segment_store.hpp"
 #include "../storage/segment_gc.hpp"
+#include "../replication/ownership_replication.hpp"
 
 struct Request {
     std::string key;
@@ -198,6 +199,7 @@ private:
         query.sender_id = leader_id;
         query.worker_id = worker_id;
         query.layout_version = store.layout_version.load();
+        query.last_segment_version = store.global_seg_ver.load();
 
         NetMessage reply;
         if (!send_message(socket, query) || !recv_message(socket, reply) ||
@@ -208,6 +210,7 @@ private:
                     return SegmentState::capture(store);
                 })) return false;
             query.layout_version = store.layout_version.load();
+            query.last_segment_version = store.global_seg_ver.load();
             if (!send_message(socket, query) || !recv_message(socket, reply)) return false;
         }
         if (reply.type != MsgType::PREFIX_REPLY ||
@@ -608,6 +611,8 @@ struct Replica {
     // Recovery takes this lock exclusively to prevent old-term replication
     // from interleaving with term fencing, installation, or summary creation.
     std::shared_mutex replication_epoch_mutex;
+    std::mutex ownership_mutex; // Serializes allocation proposals, not object replication.
+    std::unique_ptr<OwnershipReplication> ownership_replication;
     uint64_t recovery_leader_id{0}; // Candidate authorized in the current term.
     std::unordered_map<uint64_t, std::shared_ptr<FollowerProgress>>
         follower_progress;
@@ -628,6 +633,9 @@ struct Replica {
             static_cast<uint64_t>(nworkers) > kMaxReplicationWorkers) {
             throw std::invalid_argument(
                 "a replica needs between 1 and 64 workers");
+        }
+        if (segment_count > kMaxWireOwnerships) {
+            throw std::invalid_argument("segment count exceeds ownership snapshot limit");
         }
         std::unordered_set<std::string> unique_peers;
         for (const PeerEndpoint& peer : peer_endpoints) {
@@ -774,7 +782,8 @@ struct Replica {
     }
 
     std::pair<uint64_t, uint64_t> local_segment_freshness() const {
-        std::pair<uint64_t, uint64_t> freshest{0, 0};
+        std::pair<uint64_t, uint64_t> freshest{
+            store.ownership_term.load(), store.global_seg_ver.load()};
         for (const Segment* segment : store.segments) {
             if (segment->meta.status.load(std::memory_order_acquire) == static_cast<uint8_t>(SegmentStatus::FREE)) {
                 continue;
@@ -847,11 +856,11 @@ struct Replica {
         reply.type = MsgType::VOTE_REPLY;
         reply.sender_id = rs.replica_id;
         reply.status = OperationStatus::INVALID_REQUEST;
-        const auto freshness = local_segment_freshness();
-        reply.last_segment_term = freshness.first;
-        reply.last_segment_version = freshness.second;
         {
             std::lock_guard<std::mutex> lock(rs.election_mutex);
+            const auto freshness = local_segment_freshness();
+            reply.last_segment_term = freshness.first;
+            reply.last_segment_version = freshness.second;
             uint64_t current = rs.current_term.load(std::memory_order_acquire);
             if (election_enabled && msg.sender_id != rs.replica_id &&
                 msg.term >= current) {
@@ -889,11 +898,11 @@ struct Replica {
         reply.type = MsgType::PRE_VOTE_REPLY;
         reply.sender_id = rs.replica_id;
         reply.status = OperationStatus::INVALID_REQUEST;
-        const auto freshness = local_segment_freshness();
-        reply.last_segment_term = freshness.first;
-        reply.last_segment_version = freshness.second;
         {
             std::lock_guard<std::mutex> lock(rs.election_mutex);
+            const auto freshness = local_segment_freshness();
+            reply.last_segment_term = freshness.first;
+            reply.last_segment_version = freshness.second;
             const uint64_t current =
                 rs.current_term.load(std::memory_order_acquire);
             const uint64_t leader =
@@ -1386,6 +1395,7 @@ struct Replica {
         if (msg.segment_index >= store.segments.size()) {
             return OperationStatus::INVALID_REQUEST;
         }
+        if (msg.layout_version != store.layout_version.load()) return OperationStatus::OUT_OF_ORDER;
         Segment& segment = *store.segments[msg.segment_index];
         const uint8_t status = segment.meta.status.load(std::memory_order_acquire);
         if (status != static_cast<uint8_t>(SegmentStatus::FREE)) {
@@ -1418,6 +1428,7 @@ struct Replica {
         segment.meta.seg_ver.store(msg.segment_version, std::memory_order_relaxed);
         segment.meta.committed.store(false, std::memory_order_relaxed);
         store.global_seg_ver.store(msg.segment_version, std::memory_order_release);
+        store.ownership_term.store(std::max(store.ownership_term.load(), msg.segment_term));
         segment.meta.status.store(static_cast<uint8_t>(SegmentStatus::ACTIVE),
                                   std::memory_order_release);
         return OperationStatus::OK;
@@ -1530,6 +1541,7 @@ struct Replica {
             record.seq = entry.sequence;
             record.incarnation = entry.incarnation;
             record.worker_id = msg.worker_id;
+            record.sender_id = msg.sender_id;
             record.segment_index = entry.segment_index;
             record.object_index = entry.object_index;
             record.key = entry.key;
@@ -1588,7 +1600,8 @@ struct Replica {
         reply.seq = progress->term == msg.term
                         ? progress->highest_contiguous_sequence
                         : 0;
-        reply.status = msg.layout_version != reply.layout_version
+        reply.status = (msg.layout_version != reply.layout_version ||
+                        (msg.sender_id && msg.last_segment_version != store.global_seg_ver.load()))
                            ? OperationStatus::OUT_OF_ORDER
                            : progress->term <= msg.term
                            ? OperationStatus::OK
@@ -1647,6 +1660,8 @@ struct Replica {
             } else if (part.type == MsgType::STATE_END && part.seq == staged.records.size()) {
                 staged.layout = part.layout_version;
                 staged.allocation_version = part.last_segment_version;
+                staged.allocation_term = part.last_segment_term;
+                staged.ownerships = part.ownerships;
                 staged.progress = part.worker_progress;
                 std::lock_guard<std::mutex> election_lock(rs.election_mutex);
                 
@@ -1654,7 +1669,9 @@ struct Replica {
                     [&](const auto& prefix) { return prefix.term <= begin.term; }) &&
                     std::all_of(staged.records.begin(), staged.records.end(), [&](const auto& entry) {
                         return entry.term <= begin.term && entry.segment_term <= begin.term;
-                    });
+                    }) && staged.allocation_term <= begin.term &&
+                    std::all_of(staged.ownerships.begin(), staged.ownerships.end(),
+                        [&](const auto& ownership) { return ownership.term <= begin.term; });
                 if (!authorized() || !valid_terms || !staged.install(store, ht)) {
                     reply.status = OperationStatus::STORAGE_ERROR;
                 } else {
@@ -1695,6 +1712,8 @@ struct Replica {
             reply.worker_progress = reconstruct_worker_progress_locked();
             reply.layout_version = store.layout_version.load();
             reply.last_segment_version = store.global_seg_ver.load();
+            reply.last_segment_term = store.ownership_term.load();
+            reply.ownerships = SegmentState::capture_ownerships(store);
             reply.status = OperationStatus::OK;
         }
         send_message(sock, reply);
@@ -1978,7 +1997,7 @@ struct Replica {
                 store, entry.worker_id,
                 static_cast<size_t>(entry.segment_index), entry.object_index,
                 entry.key, entry.value, entry.term, entry.sequence,
-                entry.incarnation, applied, true)) {
+                entry.incarnation, applied, true, entry.segment_term, entry.segment_version)) {
             return false;
         }
         return index_apply_succeeded(
@@ -2006,6 +2025,17 @@ struct Replica {
         }
 
         ApplyRecord record{};
+        // Runtime senders must reproduce an accepted ownership descriptor;
+        // object replication is not an implicit allocation protocol.
+        if (msg.sender_id) {
+            if (msg.segment_index >= store.segments.size()) return OperationStatus::STORAGE_ERROR;
+            const auto& metadata = store.segments[msg.segment_index]->meta;
+            if (!msg.segment_term || !msg.segment_version ||
+                metadata.status.load() == static_cast<uint8_t>(SegmentStatus::FREE) ||
+                metadata.owner_id.load() != msg.worker_id ||
+                metadata.term_id.load() != msg.segment_term ||
+                metadata.seg_ver.load() != msg.segment_version) return OperationStatus::OUT_OF_ORDER;
+        }
         const bool stored = PutPath::put_replicated_at(
             store, msg.worker_id, static_cast<size_t>(msg.segment_index),
             msg.object_index, msg.key, msg.value, msg.term, msg.seq,
@@ -2072,6 +2102,76 @@ struct Replica {
         }
     }
 
+    // Caller holds the epoch barrier, but no election/data lock. A failed
+    // proposal remains empty and is retried before ANY newer allocation.
+    std::pair<OperationStatus, int64_t> allocate_owned_segment(
+        uint64_t owner, uint64_t term, bool fresh = false) {
+        std::lock_guard<std::mutex> allocation_lock(ownership_mutex);
+        if (!ownership_replication) {
+            ownership_replication = std::make_unique<OwnershipReplication>(rs, store, peer_endpoints,
+                [this](uint64_t expected_term) {
+                    std::lock_guard<std::mutex> lock(store.data_mutex);
+                    if (rs.role.load() != Role::LEADER || rs.current_term.load() != expected_term)
+                        throw std::runtime_error("ownership repair fenced");
+                    return SegmentState::capture(store);
+                }, [this](uint64_t higher) { observe_higher_term(higher); });
+        }
+        while (true) {
+            NetMessage proposal;
+            {
+                std::lock_guard<std::mutex> election_lock(rs.election_mutex);
+                std::lock_guard<std::mutex> data_lock(store.data_mutex);
+                if (stop.load() || rs.role.load() != Role::LEADER || rs.current_term.load() != term)
+                    return {OperationStatus::NOT_LEADER, -1};
+                Segment* pending_segment = nullptr;
+                for (Segment* segment : store.segments) {
+                    if (segment->meta.status.load() == static_cast<uint8_t>(SegmentStatus::ACTIVE) &&
+                        !segment->meta.committed.load()) {
+                        // Recovery seals prior-term allocations before promotion.
+                        if (segment->meta.term_id.load() != term || segment->meta.tail_idx.load() != 0)
+                            return {OperationStatus::STORAGE_ERROR, -1};
+                        pending_segment = segment;
+                        break;
+                    }
+                }
+                if (!pending_segment) {
+                    if (!fresh) {
+                        for (const Segment* segment : store.segments) {
+                            if (segment->meta.status.load() == static_cast<uint8_t>(SegmentStatus::ACTIVE) &&
+                                segment->meta.owner_id.load() == owner && segment->meta.term_id.load() == term &&
+                                segment->meta.committed.load() && !segment->is_full())
+                                return {OperationStatus::OK, static_cast<int64_t>(segment->seg_index)};
+                        }
+                    }
+                    if (store.global_seg_ver.load() == UINT64_MAX)
+                        return {OperationStatus::OUT_OF_SPACE, -1};
+                    const int64_t allocated = store.acquire_free_segment(owner, term);
+                    if (allocated < 0) return {OperationStatus::OUT_OF_SPACE, -1};
+                    pending_segment = store.segments[static_cast<size_t>(allocated)];
+                }
+                proposal.type = MsgType::SEGMENT_OWN_REQUEST;
+                proposal.term = term;
+                proposal.sender_id = rs.replica_id;
+                proposal.worker_id = pending_segment->meta.owner_id.load();
+                proposal.segment_index = pending_segment->seg_index;
+                proposal.segment_term = pending_segment->meta.term_id.load();
+                proposal.segment_version = pending_segment->meta.seg_ver.load();
+                proposal.layout_version = store.layout_version.load();
+            }
+            const OperationStatus status = ownership_replication->commit(proposal);
+            if (status != OperationStatus::OK) return {status, -1};
+            {
+                std::lock_guard<std::mutex> election_lock(rs.election_mutex);
+                std::lock_guard<std::mutex> data_lock(store.data_mutex);
+                if (rs.role.load() != Role::LEADER || rs.current_term.load() != term)
+                    return {OperationStatus::NOT_LEADER, -1};
+                store.segments[proposal.segment_index]->meta.committed.store(true);
+            }
+            if (proposal.worker_id == owner)
+                return {OperationStatus::OK, static_cast<int64_t>(proposal.segment_index)};
+        }
+    }
+
     // Opportunistic GC runs only under pressure; ordinary writes keep their
     // existing shared epoch and parallel quorum path. A busy collector is
     // skipped instead of making every worker queue behind it.
@@ -2082,14 +2182,27 @@ struct Replica {
             if (segment->meta.status.load() == static_cast<uint8_t>(SegmentStatus::FREE)) ++free;
         }
 
-        if (!force && free > std::max<size_t>(1, store.segments.size() / 4)) return 0;
+        // Reserve enough free segments for every already-running bounded
+        // batch. Waiting only at zero lets concurrent allocators exhaust the
+        // last slots before a collector can acquire the exclusive epoch.
+        const uint64_t capacity = store.segments.empty() ? 1 : std::max<uint64_t>(1, store.segments.front()->capacity);
+        const size_t batch_segments = 1 + (kReplicationBatchEntryLimit - 1) / static_cast<size_t>(capacity);
+        const size_t headroom = std::max<size_t>(1, workers.size()) * batch_segments;
+        if (!force && free > std::max(headroom, store.segments.size() / 4)) return 0;
         std::unique_lock<std::shared_mutex> epoch_lock(replication_epoch_mutex, std::defer_lock);
-        if (force || free == 0) epoch_lock.lock();
+        if (force || free <= headroom) epoch_lock.lock();
         else if (!epoch_lock.try_lock()) return 0;
         if (recovering.load() || rs.role.load() != Role::LEADER) return 0;
-        std::lock_guard<std::mutex> data_lock(store.data_mutex);
-        
-        return collect_segments(store, ht);
+        const uint64_t term = rs.current_term.load();
+        std::unique_lock<std::mutex> data_lock(store.data_mutex);
+        return collect_segments(store, ht, [&](uint64_t owner, uint64_t allocation_term) {
+            // The exclusive epoch still excludes readers and writers. Release
+            // only data_mutex so ownership repair can capture a consistent state.
+            data_lock.unlock();
+            const auto result = allocate_owned_segment(owner, allocation_term, true);
+            data_lock.lock();
+            return result.first == OperationStatus::OK ? result.second : int64_t{-1};
+        }, term);
     }
 
     // Consume bounded client batches, append immutable records locally,
@@ -2203,8 +2316,26 @@ struct Replica {
             prepared.reserve(requests.size());
             for (Request& request : requests) {
                 ApplyRecord record{};
-                if (!PutPath::put(worker, rs, store, inc, request.key,
-                                  request.value, record)) {
+                uint64_t active = worker.active_segment.load();
+                if (active >= store.segments.size() ||
+                    store.segments[active]->meta.status.load() != static_cast<uint8_t>(SegmentStatus::ACTIVE) ||
+                    store.segments[active]->meta.owner_id.load() != worker.worker_id ||
+                    store.segments[active]->meta.term_id.load() != worker_term ||
+                    !store.segments[active]->meta.committed.load() || store.segments[active]->is_full()) {
+                    storage_lock.unlock();
+                    election_lock.unlock();
+                    const auto allocation = allocate_owned_segment(worker.worker_id, worker_term);
+                    election_lock.lock();
+                    storage_lock.lock();
+                    if (allocation.first != OperationStatus::OK) {
+                        request.completion->set_value(allocation.first);
+                        continue;
+                    }
+                    active = static_cast<uint64_t>(allocation.second);
+                    worker.active_segment.store(active);
+                }
+                if (!PutPath::put_owned(worker, rs, store, inc, worker_term,
+                                  store.segments[active]->meta.seg_ver.load(), request.key, request.value, record)) {
                     DISKEYV_WARN("STORAGE",
                                  "replica=" << rs.replica_id << " worker="
                                             << worker.worker_id
@@ -2248,6 +2379,8 @@ struct Replica {
             election_lock.unlock();
             const uint64_t commit_watermark =
                 replication->wait_for_commit(ticket, quorum);
+
+            election_lock.lock();
 
             // A quorum ACK from an obsolete term must never publish data after
             // this process has observed another leader or started a campaign.
@@ -2390,6 +2523,7 @@ struct Replica {
         if (election_thread.joinable()) election_thread.join();
         pthread_join(net_thread, nullptr);
         for (pthread_t thread : workers) pthread_join(thread, nullptr);
+        ownership_replication.reset();
 
         {
             std::lock_guard<std::mutex> lock(connections_mutex);
