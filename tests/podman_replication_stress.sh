@@ -118,7 +118,7 @@ bulk_operation() {
                 "$shard_count" "$value_size" >/dev/null &
         else
             podman exec -e DISKEYV_HOST=127.0.0.1 "$container" \
-                /usr/local/bin/diskeyv-client verify 5000 "$shard_prefix" \
+                /usr/local/bin/diskeyv-client verify-local 5000 "$shard_prefix" \
                 "$shard_count" "$value_size" "$expected_term" >/dev/null &
         fi
         pids+=("$!")
@@ -141,7 +141,7 @@ wait_bulk() {
 wait_exact_read() {
     local replica=$1 key=$2 expected=$3 actual
     for _ in {1..50}; do
-        actual=$(run_client "$replica" get 5000 "$key" 2>/dev/null || true)
+        actual=$(run_client "$replica" get-local 5000 "$key" 2>/dev/null || true)
         [[ "$actual" == "$expected" ]] && return
         sleep 0.1
     done

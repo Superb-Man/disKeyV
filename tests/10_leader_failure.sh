@@ -103,7 +103,7 @@ assert_read() {
     local key=$2
     local expected_value=$3
     local output
-    output=$(run_client "$container" get 5000 "$key")
+    output=$(run_client "$container" get-local 5000 "$key")
     grep -q "Value: $expected_value" <<<"$output"
 }
 

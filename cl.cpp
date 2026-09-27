@@ -56,29 +56,34 @@ int main(int argc, char** argv) {
         std::cout << "Usage:\n";
         std::cout << " PUT: ./cl put <port> <key> <value_csv>\n";
         std::cout << " GET: ./cl get <port> <key>\n";
+        std::cout << " LOCAL DIAGNOSTIC: ./cl get-local <port> <key>\n";
         std::cout << " HEALTH: ./cl health <port>\n";
         std::cout << " LOAD: ./cl load <port> <key_prefix> <count> <value_size>\n";
         std::cout << " HOTLOAD: ./cl hotload <port> <key> <count> "
                      "<value_size> <seed>\n";
         std::cout << " VERIFY: ./cl verify <port> <key_prefix> <count> "
                      "<value_size> <term>\n";
+        std::cout << " LOCAL DIAGNOSTIC VERIFY: ./cl verify-local <port> <key_prefix> <count> <value_size> <term>\n";
         std::cout << "Set DISKEYV_HOST to connect to a non-local server.\n";
         std::cout << "Example: ./cl put 5000 mykey 1,2,3\n";
         return 1;
     }
 
     std::string op = argv[1];
+    const bool verifying = op == "verify" || op == "verify-local";
+    const bool local_read = op == "get-local" || op == "verify-local";
     int port = std::stoi(argv[2]);
 
     const bool valid_arguments =
-        (op == "put" && argc >= 5) || (op == "get" && argc >= 4) ||
+        (op == "put" && argc >= 5) || ((op == "get" || op == "get-local") && argc >= 4) ||
         (op == "health" && argc >= 3) || (op == "load" && argc >= 6) ||
         (op == "hotload" && argc >= 7) ||
-        (op == "verify" && argc >= 7);
+        (verifying && argc >= 7);
     if (!valid_arguments) {
         std::cerr << "Invalid or incomplete operation: " << op << "\n";
         return 1;
     }
+    if (local_read) std::cerr << "Diagnostic local read: may be stale or uncommitted\n";
 
     const char* configured_host = std::getenv("DISKEYV_HOST");
     const std::string host = configured_host == nullptr
@@ -122,9 +127,9 @@ int main(int argc, char** argv) {
         }
         std::cout << "PUT completed successfully\n";
 
-    } else if (op == "get") {
+    } else if (op == "get" || op == "get-local") {
         std::string key = argv[3];
-        msg.type = MsgType::CLIENT_GET;
+        msg.type = local_read ? MsgType::CLIENT_GET_LOCAL : MsgType::CLIENT_GET;
         msg.key = key;
 
         if (!send_message(sock, msg)) {
@@ -161,7 +166,7 @@ int main(int argc, char** argv) {
             std::cout << "\n";
         }
 
-    } else if (op == "load" || op == "hotload" || op == "verify") {
+    } else if (op == "load" || op == "hotload" || verifying) {
         const std::string prefix = argv[3];
         uint64_t count = 0;
         uint64_t value_size = 0;
@@ -170,7 +175,7 @@ int main(int argc, char** argv) {
         constexpr uint64_t kMaxBulkRecords = 1000000;
         if (!parse_u64(argv[4], kMaxBulkRecords, count) || count == 0 ||
             !parse_u64(argv[5], kMaxWireValueSize, value_size) ||
-            (op == "verify" &&
+            (verifying &&
              (!parse_u64(argv[6], std::numeric_limits<uint64_t>::max(),
                          expected_term) ||
               expected_term == 0)) ||
@@ -195,9 +200,10 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 NetMessage request;
-                request.type = op == "verify" ? MsgType::CLIENT_GET : MsgType::CLIENT_PUT;
+                request.type = verifying ? (local_read ? MsgType::CLIENT_GET_LOCAL : MsgType::CLIENT_GET)
+                                         : MsgType::CLIENT_PUT;
                 request.key = key;
-                if (op != "verify") {
+                if (!verifying) {
                     request.value = deterministic_value(
                         value_seed + record_index,
                         static_cast<size_t>(value_size)
@@ -218,7 +224,7 @@ int main(int argc, char** argv) {
                     close(sock);
                     return 2;
                 }
-                if (op != "verify") {
+                if (!verifying) {
                     if (reply.type != MsgType::CLIENT_PUT_REPLY ||
                         reply.status != OperationStatus::OK) {
                         std::cerr << "Bulk PUT failed at record "
@@ -245,7 +251,7 @@ int main(int argc, char** argv) {
             }
             first += in_window;
         }
-        std::cout << (op == "verify" ? "Verified " : "Loaded ") << count
+        std::cout << (verifying ? "Verified " : "Loaded ") << count
                   << " records with prefix " << prefix << "\n";
 
     } else if (op == "health") {

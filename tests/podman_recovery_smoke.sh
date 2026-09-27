@@ -87,7 +87,7 @@ assert_read() {
     local expected_term=$3
     local expected_value=$4
     local result
-    result=$(run_client "$host" get 5000 "$key")
+    result=$(run_client "$host" get-local 5000 "$key")
     grep -q "^Term: $expected_term$" <<<"$result"
     grep -q "^Value: $expected_value$" <<<"$result"
 }
@@ -125,7 +125,7 @@ bulk_operation() {
                 "$shard_count" "$value_size" >/dev/null &
         else
             podman exec -e DISKEYV_HOST=127.0.0.1 "$container" \
-                /usr/local/bin/diskeyv-client verify 5000 "$shard_prefix" \
+                /usr/local/bin/diskeyv-client verify-local 5000 "$shard_prefix" \
                 "$shard_count" "$value_size" "$expected_term" \
                 >/dev/null &
         fi

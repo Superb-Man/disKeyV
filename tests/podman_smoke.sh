@@ -112,7 +112,7 @@ wait_for_single_leader() {
 wait_for_value() {
     local replica=$1 key=$2 expected=$3 output
     for _ in {1..50}; do
-        output=$(run_client "$replica" get 5000 "$key" 2>/dev/null || true)
+        output=$(run_client "$replica" get-local 5000 "$key" 2>/dev/null || true)
         if grep -q "Value: $expected" <<<"$output"; then return 0; fi
         sleep 0.1
     done

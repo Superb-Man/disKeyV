@@ -611,7 +611,7 @@ struct Replica {
     // Recovery takes this lock exclusively to prevent old-term replication
     // from interleaving with term fencing, installation, or summary creation.
     std::shared_mutex replication_epoch_mutex;
-    std::mutex ownership_mutex; // Serializes allocation proposals, not object replication.
+    std::mutex ownership_mutex; // Serializes ownership/read control rounds, not object replication.
     std::unique_ptr<OwnershipReplication> ownership_replication;
     uint64_t recovery_leader_id{0}; // Candidate authorized in the current term.
     std::unordered_map<uint64_t, std::shared_ptr<FollowerProgress>>
@@ -1237,7 +1237,11 @@ struct Replica {
                 handle_client_put(sock, msg);
                 break;
             case MsgType::CLIENT_GET:
+            case MsgType::CLIENT_GET_LOCAL:
                 handle_client_get(sock, msg);
+                break;
+            case MsgType::READ_CONFIRM:
+                handle_read_confirm(sock, msg);
                 break;
             case MsgType::PUT_REPL:
                 handle_replication(sock, msg);
@@ -1322,24 +1326,84 @@ struct Replica {
     }
 
     void handle_client_get(int sock, const NetMessage& msg) {
-        std::shared_lock<std::shared_mutex> epoch_lock(replication_epoch_mutex);
         NetMessage reply;
         reply.type = MsgType::CLIENT_GET_REPLY;
-        if (recovering.load(std::memory_order_acquire)) {
-            reply.status = OperationStatus::RECOVERING;
-            send_message(sock, reply);
-            return;
+        const bool local = msg.type == MsgType::CLIENT_GET_LOCAL;
+        uint64_t read_term = 0;
+        {
+            std::shared_lock<std::shared_mutex> epoch_lock(replication_epoch_mutex);
+            std::lock_guard<std::mutex> election_lock(rs.election_mutex);
+            if (stop.load()) reply.status = OperationStatus::SHUTTING_DOWN;
+            else if (recovering.load()) reply.status = OperationStatus::RECOVERING;
+            else if (!local && rs.role.load() != Role::LEADER) reply.status = OperationStatus::NOT_LEADER;
+            else {
+                read_term = rs.current_term.load();
+                const ObjectEntry* entry = get(msg.key);
+                if (!entry) reply.status = OperationStatus::NOT_FOUND;
+                else {
+                    reply.term = entry->term_id;
+                    reply.seq = entry->seq_num;
+                    reply.incarnation = entry->incarnation;
+                    reply.value = entry->value;
+                }
+            }
         }
-        ObjectEntry* entry = get(msg.key);
-        if (entry == nullptr) {
-            reply.status = OperationStatus::NOT_FOUND;
-        } else {
-            reply.status = OperationStatus::OK;
-            reply.term = entry->term_id;
-            reply.seq = entry->seq_num;
-            reply.incarnation = entry->incarnation;
-            reply.value = entry->value;
+
+        // Capture first, then obtain a FRESH same-term quorum confirmation.
+        // An old heartbeat cannot validate a read that started after failover.
+        // The owned copy lets GC proceed while the network round is pending.
+        if (!local && read_term && quorum > 1) {
+            OperationStatus validation;
+            {
+                std::lock_guard<std::mutex> control_lock(ownership_mutex);
+                if (stop.load()) validation = OperationStatus::SHUTTING_DOWN;
+                else if (rs.role.load() != Role::LEADER || rs.current_term.load() != read_term)
+                    validation = OperationStatus::NOT_LEADER;
+                else validation = control_channels().confirm_read(read_term);
+            }
+            if (validation != OperationStatus::OK) {
+                reply = NetMessage{}; // Never return an unvalidated value or metadata.
+                reply.type = MsgType::CLIENT_GET_REPLY;
+                reply.status = validation;
+            }
         }
+        send_message(sock, reply);
+    }
+
+    // Confirmation does not elect, advance terms, renew a lease, or inspect
+    // follower data. A lagging follower can still confirm the elected leader.
+    void handle_read_confirm(int sock, const NetMessage& msg) {
+        NetMessage reply;
+        reply.type = MsgType::READ_CONFIRM_REPLY;
+        reply.sender_id = rs.replica_id;
+        reply.seq = msg.seq;
+
+        {
+            std::lock_guard<std::mutex> lock(rs.election_mutex);
+
+            reply.term = rs.current_term.load(std::memory_order_acquire);
+            reply.status = OperationStatus::NOT_LEADER;
+
+            if (stop.load(std::memory_order_acquire)) {
+                reply.status = OperationStatus::SHUTTING_DOWN;
+            }
+            else if (message_detail::valid_shape(msg) &&
+                    msg.sender_id != rs.replica_id &&
+                    rs.role.load(std::memory_order_acquire) == Role::FOLLOWER &&
+                    msg.term == reply.term) {
+
+                const bool authorized_leader =
+                    election_enabled
+                        ? msg.sender_id ==
+                            rs.leader_id.load(std::memory_order_acquire)
+                        : recovery_leader_id != 0 &&
+                        msg.sender_id == recovery_leader_id;
+
+                if (authorized_leader)
+                    reply.status = OperationStatus::OK;
+            }
+        }
+
         send_message(sock, reply);
     }
 
@@ -2102,11 +2166,9 @@ struct Replica {
         }
     }
 
-    // Caller holds the epoch barrier, but no election/data lock. A failed
-    // proposal remains empty and is retried before ANY newer allocation.
-    std::pair<OperationStatus, int64_t> allocate_owned_segment(
-        uint64_t owner, uint64_t term, bool fresh = false) {
-        std::lock_guard<std::mutex> allocation_lock(ownership_mutex);
+    // Caller holds ownership_mutex. Reads reuse the same bounded channels;
+    // there is no extra thread or connection created per GET.
+    OwnershipReplication& control_channels() {
         if (!ownership_replication) {
             ownership_replication = std::make_unique<OwnershipReplication>(rs, store, peer_endpoints,
                 [this](uint64_t expected_term) {
@@ -2116,6 +2178,15 @@ struct Replica {
                     return SegmentState::capture(store);
                 }, [this](uint64_t higher) { observe_higher_term(higher); });
         }
+        return *ownership_replication;
+    }
+
+    // Caller holds the epoch barrier, but no election/data lock. A failed
+    // proposal remains empty and is retried before ANY newer allocation.
+    std::pair<OperationStatus, int64_t> allocate_owned_segment(
+        uint64_t owner, uint64_t term, bool fresh = false) {
+        std::lock_guard<std::mutex> allocation_lock(ownership_mutex);
+        control_channels();
         while (true) {
             NetMessage proposal;
             {
@@ -2523,7 +2594,6 @@ struct Replica {
         if (election_thread.joinable()) election_thread.join();
         pthread_join(net_thread, nullptr);
         for (pthread_t thread : workers) pthread_join(thread, nullptr);
-        ownership_replication.reset();
 
         {
             std::lock_guard<std::mutex> lock(connections_mutex);
@@ -2539,6 +2609,8 @@ struct Replica {
             pthread_join(connection->thread, nullptr);
         }
         connections.clear();
+        // Client GET handlers now use these channels too; drain them first.
+        ownership_replication.reset();
         DISKEYV_INFO("REPLICA",
                      "replica=" << rs.replica_id << " phase=shutdown-complete"
                                 << " connections="

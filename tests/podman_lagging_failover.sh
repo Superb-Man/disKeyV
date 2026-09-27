@@ -108,7 +108,7 @@ wait_for_leader() {
 
 has_value() {
     local alias=$1 key=$2 expected=$3
-    run_client "$alias" get 5000 "$key" 2>/dev/null | \
+    run_client "$alias" get-local 5000 "$key" 2>/dev/null | \
         grep -q "^Value: $expected$"
 }
 
@@ -124,7 +124,7 @@ wait_for_value() {
 # Check every key, its original term, and all 64 deterministic value bytes.
 verify_history() {
     local alias=$1
-    if ! run_client "$alias" verify 5000 quorum-only- "$record_count" 64 \
+    if ! run_client "$alias" verify-local 5000 quorum-only- "$record_count" 64 \
         "$committed_term"; then
         echo "FAIL: incomplete or corrupted committed history on $alias" >&2
         return 1
@@ -182,7 +182,7 @@ done
 for replica in "${laggers[@]}"; do
     # Require a real NOT_FOUND response; a connection error does not prove lag.
     missing_status=0
-    missing_output=$(run_client "$replica" get 5000 quorum-only-0 2>&1) || \
+    missing_output=$(run_client "$replica" get-local 5000 quorum-only-0 2>&1) || \
         missing_status=$?
     if [[ "$missing_status" != 3 || "$missing_output" != *"GET failed: NOT_FOUND"* ]]; then
         echo "FAIL: could not confirm missing committed data on $replica: $missing_output" >&2
