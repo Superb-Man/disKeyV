@@ -73,6 +73,7 @@ struct ReplicationSession {
     PeerEndpoint endpoint;              // Follower represented by this channel.
     int socket{-1};                     // -1 means disconnected.
     uint64_t highest_acked{0};          // Cumulative contiguous follower ACK.
+    uint64_t highest_index_notified{0}; // Leader-published prefix confirmed on this socket.
     bool prefix_synchronized{false};    // Prefix query completed on this socket.
     uint64_t layout_version{0};
 
@@ -86,6 +87,7 @@ struct ReplicationSession {
         close(socket);
         socket = -1;
         prefix_synchronized = false;
+        highest_index_notified = 0; // A restarted follower may have lost its index.
     }
 
     bool ensure_connected() {
@@ -185,6 +187,33 @@ struct ReplicationSession {
             ++transport_failures;
         }
         return false;
+    }
+
+    // Sent after leader-local publication; it is never on the client PUT's
+    // acknowledgement path. The follower reply confirms receipt of the
+    // published prefix, not completion of its local hash updates.
+    bool notify_index_commit(uint64_t term, uint64_t leader_id,
+                             uint64_t worker_id, uint64_t prefix,
+                             uint64_t layout) {
+        if (prefix <= highest_index_notified) return true;
+        if (socket < 0 || !prefix_synchronized) return false;
+        NetMessage request;
+        request.type = MsgType::INDEX_COMMIT;
+        request.term = term;
+        request.sender_id = leader_id;
+        request.worker_id = worker_id;
+        request.seq = prefix;
+        request.layout_version = layout;
+        NetMessage reply;
+        if (!send_message(socket, request) || !recv_message(socket, reply) ||
+            reply.type != MsgType::ACK || reply.status != OperationStatus::OK ||
+            reply.term != term || reply.worker_id != worker_id ||
+            reply.seq != prefix) {
+            disconnect();
+            return false;
+        }
+        highest_index_notified = prefix;
+        return true;
     }
 
 private:
@@ -359,6 +388,16 @@ public:
         return watermark;
     }
 
+    void note_index_committed(uint64_t prefix) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (prefix <= committed_sequence_) return;
+        if (prefix > published_sequence_)
+            throw std::runtime_error("index commit exceeds stored worker prefix");
+        committed_sequence_ = prefix;
+        ++commit_generation_;
+        work_cv_.notify_all();
+    }
+
 private:
     struct Channel {
         explicit Channel(const PeerEndpoint& endpoint) : session(endpoint) {}
@@ -367,6 +406,7 @@ private:
         std::thread thread;
         uint64_t prefix{0};               // Last ACK copied from the session.
         uint64_t completed_generation{0}; // Last publication attempt finished.
+        uint64_t completed_commit_generation{0}; // Last index notification attempted.
         bool failure_active{false};       // Suppresses repeated outage warnings.
         uint64_t layout_version{0};
     };
@@ -388,6 +428,8 @@ private:
     std::condition_variable progress_cv_;
     bool stopping_{false};                  // Requests channel thread exit.
     uint64_t generation_{0};                // Increments once per published batch.
+    uint64_t commit_generation_{0};         // Increments after leader index publication.
+    uint64_t committed_sequence_{0};        // Contiguous leader-indexed worker prefix.
     size_t published_sequence_{0};          // Independent of replay metadata size.
     std::vector<ReplaySegment> replay_segments_; // Sorted contiguous sequence ranges.
     uint64_t range_layout_{0};
@@ -494,19 +536,23 @@ private:
         Channel& channel = *channels_[channel_index];
         while (true) {
             uint64_t generation = 0;
+            uint64_t commit_generation = 0;
             size_t target_sequence = 0;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 work_cv_.wait_for(lock, std::chrono::milliseconds(250), [&] {
-                    return stopping_ || generation_ > channel.completed_generation;
+                    return stopping_ || generation_ > channel.completed_generation ||
+                           commit_generation_ > channel.completed_commit_generation;
                 });
                 if (stopping_) return;
                 if (generation_ == 0 ||
                     (channel.prefix >= published_sequence_ &&
-                     channel.layout_version == store_.layout_version.load())) {
+                     channel.layout_version == store_.layout_version.load() &&
+                     channel.session.highest_index_notified >= committed_sequence_)) {
                     continue;
                 }
                 generation = generation_;
+                commit_generation = commit_generation_;
                 target_sequence = published_sequence_;
             }
 
@@ -554,6 +600,23 @@ private:
                                        << current_prefix);
             }
             progress_cv_.notify_all();
+            if (replicated) {
+                uint64_t commit_target = 0;
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    commit_target = std::min(committed_sequence_, channel.prefix);
+                }
+                if (commit_target > channel.session.highest_index_notified) {
+                    channel.session.notify_index_commit(
+                        term_, leader_id_, worker_id_, commit_target,
+                        store_.layout_version.load(std::memory_order_acquire)
+                    );
+                }
+            }
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                channel.completed_commit_generation = commit_generation;
+            }
         }
     }
 };
@@ -562,6 +625,8 @@ struct FollowerProgress {
     std::mutex mutex;
     uint64_t term{0}; // Term to which the cumulative prefix belongs.
     uint64_t highest_contiguous_sequence{0}; // Gaps stop advancement here.
+    uint64_t index_committed_sequence{0}; // Leader-published prefix learned separately from storage ACKs.
+    std::deque<ApplyRecord> pending_index; // Offsets only, until publication is authorized.
 };
 
 struct Replica;
@@ -616,6 +681,11 @@ struct Replica {
     uint64_t recovery_leader_id{0}; // Candidate authorized in the current term.
     std::unordered_map<uint64_t, std::shared_ptr<FollowerProgress>>
         follower_progress;
+    static constexpr size_t kFollowerIndexQueueLimit = 4096;
+    std::mutex follower_index_mutex;
+    std::condition_variable follower_index_cv;
+    std::deque<ApplyRecord> follower_index_queue; // Offsets only; payload stays in SegmentStore.
+    std::thread follower_index_thread;
 
     Replica(uint64_t rid, int nworkers, Role role, int port,
             const std::vector<PeerEndpoint>& peers,
@@ -693,6 +763,12 @@ struct Replica {
 
         start_workers(nworkers);
         start_network_thread();
+        try {
+            follower_index_thread = std::thread([this] { follower_index_loop(); });
+        } catch (...) {
+            shutdown();
+            throw;
+        }
         if (election_enabled) start_election_thread();
         DISKEYV_INFO("REPLICA",
                      "replica=" << rid << " phase=ready role="
@@ -769,6 +845,7 @@ struct Replica {
             });
         } catch (...) {
             stop.store(true, std::memory_order_release);
+            follower_index_cv.notify_all();
             const int listening_socket = server_sock.exchange(-1, std::memory_order_acq_rel);
             if (listening_socket >= 0) {
                 ::shutdown(listening_socket, SHUT_RDWR);
@@ -777,6 +854,7 @@ struct Replica {
             pthread_cond_broadcast(&req_cv);
             pthread_join(net_thread, nullptr);
             for (pthread_t thread : workers) pthread_join(thread, nullptr);
+            if (follower_index_thread.joinable()) follower_index_thread.join();
             throw;
         }
     }
@@ -1051,10 +1129,11 @@ struct Replica {
                 // Wait for old local PUTs and follower installs to finish, then
                 // keep storage stable throughout snapshot, import, and repair.
                 std::unique_lock<std::shared_mutex> epoch_lock(replication_epoch_mutex);
+                clear_follower_index_queue(); // Recovery rebuilds the complete index.
                 RecoveryCoordinator coordinator(rs, store, ht, peer_endpoints, workers.size());
                 coordinator.recover_elected(term);
                 std::lock_guard<std::mutex> data_lock(store.data_mutex);
-                reconstruct_worker_progress_locked();
+                reconstruct_worker_progress_locked(true);
             });
             while (recovery.wait_for(kHeartbeatInterval) != std::future_status::ready &&
                    !stop.load(std::memory_order_acquire)) {
@@ -1248,6 +1327,9 @@ struct Replica {
                 break;
             case MsgType::PUT_REPL_BATCH:
                 handle_replication_batch(sock, msg);
+                break;
+            case MsgType::INDEX_COMMIT:
+                handle_index_commit(sock, msg);
                 break;
             case MsgType::PREFIX_QUERY:
                 handle_prefix_query(sock, msg);
@@ -1636,6 +1718,49 @@ struct Replica {
         send_message(sock, reply);
     }
 
+    // Storage ACKs can precede majority commit. Only a recognized leader's
+    // subsequently published prefix may release follower offsets for indexing.
+    void handle_index_commit(int sock, const NetMessage& msg) {
+        std::shared_lock<std::shared_mutex> epoch_lock(replication_epoch_mutex);
+        NetMessage reply;
+        reply.type = MsgType::ACK;
+        reply.term = rs.current_term.load(std::memory_order_acquire);
+        reply.worker_id = msg.worker_id;
+        reply.seq = msg.seq;
+
+        if (stop.load(std::memory_order_acquire) ||
+            rs.role.load(std::memory_order_acquire) != Role::FOLLOWER ||
+            msg.term != reply.term ||
+            (election_enabled && msg.sender_id != rs.leader_id.load(std::memory_order_acquire)) ||
+            (!election_enabled && recovery_leader_id != 0 &&
+             msg.sender_id != recovery_leader_id)) {
+
+            reply.status = OperationStatus::NOT_LEADER;
+            send_message(sock, reply);
+            return;
+        }
+
+        const auto progress = progress_for(msg.worker_id);
+        std::lock_guard<std::mutex> progress_lock(progress->mutex);
+        std::lock_guard<std::mutex> data_lock(store.data_mutex);
+        if (msg.layout_version != store.layout_version.load(std::memory_order_acquire) ||
+            progress->term != msg.term ||
+            msg.seq > progress->highest_contiguous_sequence) {
+            reply.status = OperationStatus::OUT_OF_ORDER;
+        } else if (msg.seq > progress->index_committed_sequence) {
+            while (!progress->pending_index.empty()) {
+                const ApplyRecord& record = progress->pending_index.front();
+                const ObjectEntry& entry = store.segments[record.seg_idx]->entries[record.obj_idx];
+                if (entry.seq_num > msg.seq) break;
+
+                queue_follower_index(record);
+                progress->pending_index.pop_front();
+            }
+            progress->index_committed_sequence = msg.seq;
+        }
+        send_message(sock, reply);
+    }
+
     void handle_prefix_query(int sock, const NetMessage& msg) {
         std::shared_lock<std::shared_mutex> epoch_lock(
             replication_epoch_mutex
@@ -1739,7 +1864,8 @@ struct Replica {
                 if (!authorized() || !valid_terms || !staged.install(store, ht)) {
                     reply.status = OperationStatus::STORAGE_ERROR;
                 } else {
-                    reconstruct_worker_progress_locked();
+                    clear_follower_index_queue(); // Old offsets may now name other objects.
+                    reconstruct_worker_progress_locked(true);
                     recovering.store(false, std::memory_order_release);
                     DISKEYV_INFO("GC", "replica=" << rs.replica_id << " state=installed layout="
                         << staged.layout << " records=" << staged.records.size());
@@ -1971,7 +2097,8 @@ struct Replica {
 
     // Rebuild follower ACK state by grouping stored entries by worker and term,
     // then retaining the newest term's longest gap-free sequence prefix.
-    std::vector<WorkerProgressWire> reconstruct_worker_progress_locked() {
+    std::vector<WorkerProgressWire> reconstruct_worker_progress_locked(
+        bool index_rebuilt = false) {
         std::map<uint64_t, std::map<uint64_t, std::set<uint64_t>>> sequences;
         for (const Segment* segment : store.segments) {
             if (segment->meta.status.load(std::memory_order_acquire) == static_cast<uint8_t>(SegmentStatus::FREE)) {
@@ -2027,11 +2154,23 @@ struct Replica {
         }
 
         std::lock_guard<std::mutex> map_lock(follower_progress_mutex);
+        auto previous = std::move(follower_progress);
         follower_progress.clear();
         for (const WorkerProgressWire& progress : result) {
             auto value = std::make_shared<FollowerProgress>();
             value->term = progress.term;
             value->highest_contiguous_sequence = progress.sequence;
+            if (index_rebuilt) {
+                value->index_committed_sequence = progress.sequence;
+            } else {
+                // A summary only recomputes storage progress; it must not
+                // silently forget offset work awaiting a leader commit notice.
+                const auto old = previous.find(progress.worker_id);
+                if (old != previous.end() && old->second->term == progress.term) {
+                    value->index_committed_sequence = std::min(old->second->index_committed_sequence, progress.sequence);
+                    value->pending_index = std::move(old->second->pending_index);
+                }
+            }
             follower_progress.emplace(progress.worker_id, std::move(value));
         }
         return result;
@@ -2106,7 +2245,11 @@ struct Replica {
             msg.incarnation, record, false, msg.segment_term, msg.segment_version);
         if (!stored) return OperationStatus::STORAGE_ERROR;
 
-        ht.apply(store, record.seg_idx, record.obj_idx);
+        if (progress.term != msg.term) {
+            progress.pending_index.clear();
+            progress.index_committed_sequence = 0;
+        }
+        progress.pending_index.push_back(record);
         progress.term = msg.term;
         progress.highest_contiguous_sequence = msg.seq;
         store.progress[msg.worker_id] = {msg.term, msg.seq};
@@ -2132,6 +2275,60 @@ struct Replica {
         auto& progress = follower_progress[worker_id];
         if (!progress) progress = std::make_shared<FollowerProgress>();
         return progress;
+    }
+
+    // Called after the immutable object is stored, with the shared epoch and
+    // data mutex held. A full queue falls back to inline publication so it
+    // remains bounded; the ACK itself still certifies storage, not indexing.
+    void queue_follower_index(const ApplyRecord& record) {
+        {
+            std::lock_guard<std::mutex> lock(follower_index_mutex);
+            if (follower_index_queue.size() < kFollowerIndexQueueLimit) {
+                const bool was_empty = follower_index_queue.empty();
+                follower_index_queue.push_back(record);
+                if (was_empty) follower_index_cv.notify_one();
+
+                return;
+            }
+        }
+        ht.apply(store, record.seg_idx, record.obj_idx);
+    }
+
+    // The epoch is acquired before dequeuing. Recovery/layout replacement can
+    // therefore exclude this worker and discard only tasks it will rebuild.
+    void follower_index_loop() {
+        while (true) {
+            {
+                std::unique_lock<std::mutex> lock(follower_index_mutex);
+                follower_index_cv.wait(lock, [&] {
+                    return stop.load(std::memory_order_acquire) || !follower_index_queue.empty();
+                });
+                if (stop.load(std::memory_order_acquire)) return;
+            }
+            std::shared_lock<std::shared_mutex> epoch_lock(replication_epoch_mutex);
+            std::vector<ApplyRecord> batch;
+            {
+                std::lock_guard<std::mutex> lock(follower_index_mutex);
+                const size_t count = std::min<size_t>(64, follower_index_queue.size());
+                
+                batch.reserve(count);
+                
+                for (size_t i = 0; i < count; ++i) {
+                    batch.push_back(follower_index_queue.front());
+                    follower_index_queue.pop_front();
+                }
+            }
+            if (batch.empty()) continue;
+            std::lock_guard<std::mutex> data_lock(store.data_mutex);
+            for (const ApplyRecord& record : batch)
+                ht.apply(store, record.seg_idx, record.obj_idx);
+        }
+    }
+
+    // Caller holds the exclusive epoch: no task can be in flight or dequeued.
+    void clear_follower_index_queue() {
+        std::lock_guard<std::mutex> lock(follower_index_mutex);
+        follower_index_queue.clear();
     }
 
     static void* worker_entry(void* arg) {
@@ -2286,6 +2483,7 @@ struct Replica {
         uint64_t worker_term = 0;
         std::deque<ApplyRecord> pending;
         uint64_t produced_sequence = 0;
+        uint64_t indexed_sequence = 0; // Contiguous successful leader hash publications.
 
         while (true) {
             pthread_mutex_lock(&req_mtx);
@@ -2360,6 +2558,7 @@ struct Replica {
                 worker.sequence_number.store(0, std::memory_order_release);
                 pending.clear();
                 produced_sequence = 0;
+                indexed_sequence = 0;
                 replication = std::make_unique<ParallelReplicationGroup>(
                     observed_term, rs.replica_id, worker.worker_id,
                     peer_endpoints, store);
@@ -2477,6 +2676,8 @@ struct Replica {
                 const IndexApplyResult publication =
                     ht.apply(store, candidate.seg_idx, candidate.obj_idx);
                 publications.emplace(entry.seq_num, publication);
+                if (entry.seq_num == indexed_sequence + 1 &&
+                    index_apply_succeeded(publication)) ++indexed_sequence;
                 --store.pending[candidate.seg_idx];
                 pending.pop_front();
             }
@@ -2505,6 +2706,9 @@ struct Replica {
                                             << " status=" << status_name(result));
                 }
             }
+            // Follower hash pointers lag the leader's own successful apply.
+            // Notification happens in channel threads, not on this PUT path.
+            replication->note_index_committed(indexed_sequence);
         }
     }
 
@@ -2582,6 +2786,7 @@ struct Replica {
         DISKEYV_INFO("REPLICA",
                      "replica=" << rs.replica_id << " phase=shutdown-start");
         stop.store(true, std::memory_order_release);
+        follower_index_cv.notify_all();
 
         const int listening_socket =
             server_sock.exchange(-1, std::memory_order_acq_rel);
@@ -2609,6 +2814,7 @@ struct Replica {
             pthread_join(connection->thread, nullptr);
         }
         connections.clear();
+        if (follower_index_thread.joinable()) follower_index_thread.join();
         // Client GET handlers now use these channels too; drain them first.
         ownership_replication.reset();
         DISKEYV_INFO("REPLICA",

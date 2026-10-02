@@ -43,7 +43,8 @@ enum class MsgType : uint8_t {
     STATE_END = 29,
     READ_CONFIRM = 30,
     READ_CONFIRM_REPLY = 31,
-    CLIENT_GET_LOCAL = 32 // Explicit diagnostic read; no consistency guarantee.
+    CLIENT_GET_LOCAL = 32, // Explicit diagnostic read; no consistency guarantee.
+    INDEX_COMMIT = 33      // Leader's locally published worker prefix.
 };
 
 enum class OperationStatus : uint8_t {
@@ -131,7 +132,7 @@ struct NetMessage {
 };
 
 constexpr uint32_t kProtocolMagic = 0x444b5633U;
-constexpr uint16_t kProtocolVersion = 9;         // Quorum-confirmed GET and explicit local diagnostics.
+constexpr uint16_t kProtocolVersion = 10;        // Follower index notifications follow leader publication.
 constexpr uint32_t kMaxWireKeySize = 63;
 constexpr uint32_t kMaxWireValueSize = 1024U * 1024U;
 constexpr uint32_t kMaxWireBatchEntries = 16;
@@ -156,7 +157,7 @@ inline uint64_t network_to_host_u64(uint64_t value) {
 
 inline bool valid_message_type(uint8_t type) {
     return type >= static_cast<uint8_t>(MsgType::PUT_REPL) &&
-           type <= static_cast<uint8_t>(MsgType::CLIENT_GET_LOCAL);
+           type <= static_cast<uint8_t>(MsgType::INDEX_COMMIT);
 }
 
 namespace message_detail {
@@ -272,6 +273,18 @@ inline bool valid_shape(const NetMessage& message) {
                message.layout_version == 0 && message.last_segment_term == 0 &&
                message.last_segment_version == 0 &&
                (message.type != MsgType::READ_CONFIRM || message.status == OperationStatus::OK);
+    }
+    if (message.type == MsgType::INDEX_COMMIT) {
+        return message.status == OperationStatus::OK && message.term > 0 &&
+               message.sender_id > 0 &&
+               message.sender_id != std::numeric_limits<uint64_t>::max() &&
+               message.worker_id < kMaxWireWorkerProgress && message.seq > 0 &&
+               message.key.empty() && message.value.empty() &&
+               message.entries.empty() && message.worker_progress.empty() &&
+               message.ownerships.empty() && message.incarnation == 0 &&
+               message.segment_index == 0 && message.object_index == 0 &&
+               message.segment_term == 0 && message.segment_version == 0 &&
+               message.last_segment_term == 0 && message.last_segment_version == 0;
     }
     const bool ownership_request = message.type == MsgType::SEGMENT_OWN_REQUEST;
     const bool ownership_reply = message.type == MsgType::SEGMENT_OWN_REPLY;
